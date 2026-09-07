@@ -3,6 +3,13 @@ import { z } from "zod";
 
 let workerEnv;
 
+function toGithubApiUrl(rawUrl) {
+  const m = rawUrl.match(/^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/);
+  if (!m) return null;
+  const [, owner, repo, branch, path] = m;
+  return `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${branch}`;
+}
+
 function createServer() {
   const server = new McpServer({
     name: "hello-server",
@@ -42,9 +49,14 @@ function createServer() {
         return { content: [{ type: "text", text: "env hâlâ yakalanamadı" }] };
       }
 
-      const fileRes = await fetch(source_url, {
+      const apiUrl = toGithubApiUrl(source_url);
+      const fetchUrl = apiUrl || source_url;
+
+      const fileRes = await fetch(fetchUrl, {
         headers: {
-          Authorization: `Bearer ${env.GITHUB_TOKEN}`
+          Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+          Accept: "application/vnd.github.raw+json",
+          "User-Agent": "ai-router-worker"
         }
       });
       if (!fileRes.ok) {
