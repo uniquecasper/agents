@@ -77,11 +77,22 @@ function createServer() {
   return server;
 }
 
+function captureEnv(fn, boundTo) {
+  return function (...args) {
+    if (args.length >= 2) workerEnv = args[1];
+    return fn.apply(boundTo, args);
+  };
+}
+
 const rawHandler = createMcpHandler(createServer);
 
 export default new Proxy(rawHandler, {
   apply(target, thisArg, args) {
-    workerEnv = args[1];
+    if (args.length >= 2) workerEnv = args[1];
     return Reflect.apply(target, thisArg, args);
+  },
+  get(target, prop, receiver) {
+    const value = Reflect.get(target, prop, receiver);
+    return typeof value === "function" ? captureEnv(value, target) : value;
   }
 });
