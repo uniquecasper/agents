@@ -77,11 +77,11 @@ function createServer() {
   return server;
 }
 
-const mcpHandler = createMcpHandler(createServer);
+const rawHandler = createMcpHandler(createServer);
 
-export default {
-  async fetch(request, env, ctx) {
-    workerEnv = env;
-    return mcpHandler(request, env, ctx);
+export default new Proxy(rawHandler, {
+  apply(target, thisArg, args) {
+    workerEnv = args[1];
+    return Reflect.apply(target, thisArg, args);
   }
-};
+});
