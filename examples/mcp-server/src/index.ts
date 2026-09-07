@@ -34,7 +34,7 @@ function createServer(req, env) {
         task: z.string().describe("What to do with the file, e.g. 'find bugs'")
       })
     },
-    async ({ source_url, task }, { env }) => {
+    async ({ source_url, task }) => {
       const fileRes = await fetch(source_url, {
         headers: {
           Authorization: `Bearer ${env.GITHUB_TOKEN}`
