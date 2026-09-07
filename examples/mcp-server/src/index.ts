@@ -1,41 +1,18 @@
-import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
-import { z } from "zod";
-
-function createServer(req, env) {
-  const server = new McpServer({
-    name: "hello-server",
-    version: "1.0.0"
-  });
-
-  server.registerTool(
-    "hello",
-    {
-      description: "Returns a greeting",
-      inputSchema: z.object({
-        name: z.string().optional()
-      })
-    },
-    async ({ name }) => ({
-      content: [
-        {
-          type: "text",
-          text: `Hello, ${name ?? "World"}!`
-        }
-      ]
-    })
-  );
-
-  server.registerTool(
+server.registerTool(
     "ask_ai",
     {
-      description: "Fetches a file from a public URL and asks Gemini to analyze it, returning only Gemini's answer.",
+      description: "Fetches a file from a public or private (via token) URL and asks Gemini to analyze it, returning only Gemini's answer.",
       inputSchema: z.object({
         source_url: z.string().describe("Public URL of the file (e.g. raw.githubusercontent.com link)"),
         task: z.string().describe("What to do with the file, e.g. 'find bugs'")
       })
     },
-    async ({ source_url, task }) => {
-      const fileRes = await fetch(source_url);
+    async ({ source_url, task }, { env }) => {
+      const fileRes = await fetch(source_url, {
+        headers: {
+          Authorization: `Bearer ${env.GITHUB_TOKEN}`
+        }
+      });
       if (!fileRes.ok) {
         return { content: [{ type: "text", text: `Dosya çekilemedi: ${fileRes.status}` }] };
       }
@@ -62,8 +39,3 @@ function createServer(req, env) {
       return { content: [{ type: "text", text: answer }] };
     }
   );
-
-  return server;
-}
-
-export default createMcpHandler(createServer);
