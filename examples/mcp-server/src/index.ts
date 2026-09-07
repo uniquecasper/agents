@@ -1,4 +1,31 @@
-server.registerTool(
+import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
+import { z } from "zod";
+
+function createServer(req, env) {
+  const server = new McpServer({
+    name: "hello-server",
+    version: "1.0.0"
+  });
+
+  server.registerTool(
+    "hello",
+    {
+      description: "Returns a greeting",
+      inputSchema: z.object({
+        name: z.string().optional()
+      })
+    },
+    async ({ name }) => ({
+      content: [
+        {
+          type: "text",
+          text: `Hello, ${name ?? "World"}!`
+        }
+      ]
+    })
+  );
+
+  server.registerTool(
     "ask_ai",
     {
       description: "Fetches a file from a public or private (via token) URL and asks Gemini to analyze it, returning only Gemini's answer.",
@@ -39,3 +66,8 @@ server.registerTool(
       return { content: [{ type: "text", text: answer }] };
     }
   );
+
+  return server;
+}
+
+export default createMcpHandler(createServer);
