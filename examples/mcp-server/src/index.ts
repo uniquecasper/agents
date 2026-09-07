@@ -1,7 +1,9 @@
 import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
-function createServer(req, env) {
+let workerEnv;
+
+function createServer() {
   const server = new McpServer({
     name: "hello-server",
     version: "1.0.0"
@@ -34,18 +36,52 @@ function createServer(req, env) {
         task: z.string().describe("What to do with the file, e.g. 'find bugs'")
       })
     },
-    async (input, ...rest) => {
-      const ctx = rest[0] || {};
-      return {
-        content: [{
-          type: "text",
-          text: `http keys: ${ctx.http ? JSON.stringify(Object.keys(ctx.http)) : "yok"} | mcpReq keys: ${ctx.mcpReq ? JSON.stringify(Object.keys(ctx.mcpReq)) : "yok"}`
-        }]
-      };
+    async ({ source_url, task }) => {
+      const env = workerEnv;
+      if (!env) {
+        return { content: [{ type: "text", text: "env hâlâ yakalanamadı" }] };
+      }
+
+      const fileRes = await fetch(source_url, {
+        headers: {
+          Authorization: `Bearer ${env.GITHUB_TOKEN}`
+        }
+      });
+      if (!fileRes.ok) {
+        return { content: [{ type: "text", text: `Dosya çekilemedi: ${fileRes.status}` }] };
+      }
+      const fileContent = await fileRes.text();
+
+      const prompt = `${task}\n\nKısa ve öz cevap ver, sadece bulguları listele, dosyayı tekrar yazma.\n\n---DOSYA---\n${fileContent}`;
+
+      const geminiRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${env.GEMINI_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+        }
+      );
+
+      if (!geminiRes.ok) {
+        const errText = await geminiRes.text();
+        return { content: [{ type: "text", text: `Gemini hata: ${geminiRes.status} — ${errText}` }] };
+      }
+
+      const data = await geminiRes.json();
+      const answer = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "Gemini boş cevap döndü.";
+      return { content: [{ type: "text", text: answer }] };
     }
   );
 
   return server;
 }
 
-export default createMcpHandler(createServer);
+const mcpHandler = createMcpHandler(createServer);
+
+export default {
+  async fetch(request, env, ctx) {
+    workerEnv = env;
+    return mcpHandler(request, env, ctx);
+  }
+};
