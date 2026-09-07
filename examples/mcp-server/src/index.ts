@@ -35,10 +35,11 @@ function createServer(req, env) {
       })
     },
     async (input, ...rest) => {
+      const ctx = rest[0] || {};
       return {
         content: [{
           type: "text",
-          text: `input: ${JSON.stringify(Object.keys(input))} | rest sayısı: ${rest.length} | rest[0]: ${rest[0] ? JSON.stringify(Object.keys(rest[0])) : "yok"} | dış env tipi: ${typeof env}`
+          text: `http keys: ${ctx.http ? JSON.stringify(Object.keys(ctx.http)) : "yok"} | mcpReq keys: ${ctx.mcpReq ? JSON.stringify(Object.keys(ctx.mcpReq)) : "yok"}`
         }]
       };
     }
