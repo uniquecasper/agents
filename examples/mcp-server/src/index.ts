@@ -40,10 +40,12 @@ function createServer() {
       description: "Fetches a file from a public or private (via token) URL and asks Gemini to analyze it, returning only Gemini's answer.",
       inputSchema: z.object({
         source_url: z.string().describe("Public URL of the file (e.g. raw.githubusercontent.com link)"),
-        task: z.string().describe("What to do with the file, e.g. 'find bugs'")
+        task: z.string().describe("What to do with the file, e.g. 'find bugs'"),
+        model: z.string().optional().describe("Gemini model name, e.g. 'gemini-3.6-flash' or 'gemini-3.6-pro'. Defaults to gemini-3.6-flash."),
+        extended_thinking: z.boolean().optional().describe("If true, enables deeper reasoning (slower, better for complex tasks). Default false.")
       })
     },
-    async ({ source_url, task }) => {
+    async ({ source_url, task, model, extended_thinking }) => {
       const env = workerEnv;
       if (!env) {
         return { content: [{ type: "text", text: "env hâlâ yakalanamadı" }] };
@@ -66,12 +68,22 @@ function createServer() {
 
       const prompt = `${task}\n\nKısa ve öz cevap ver, sadece bulguları listele, dosyayı tekrar yazma.\n\n---DOSYA---\n${fileContent}`;
 
+      const selectedModel = model || "gemini-3.6-flash";
+      const requestBody = {
+        contents: [{ parts: [{ text: prompt }] }]
+      };
+      if (extended_thinking) {
+        requestBody.generationConfig = {
+          thinkingConfig: { thinkingLevel: "high" }
+        };
+      }
+
       const geminiRes = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${env.GEMINI_API_KEY}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=${env.GEMINI_API_KEY}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+          body: JSON.stringify(requestBody)
         }
       );
 
