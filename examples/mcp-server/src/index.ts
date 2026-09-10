@@ -41,60 +41,67 @@ function createServer() {
       inputSchema: z.object({
         source_url: z.string().describe("Public URL of the file (e.g. raw.githubusercontent.com link)"),
         task: z.string().describe("What to do with the file, e.g. 'find bugs'"),
-        model: z.string().optional().describe("Gemini model name, e.g. 'gemini-3.6-flash' or 'gemini-3.6-pro'. Defaults to gemini-3.6-flash."),
+        model: z.string().optional().describe("Gemini model name, e.g. 'gemini-3.6-flash'. Defaults to gemini-3.6-flash. (Pro modelleri free tier key'de quota=0 olduğu için şu an çalışmıyor.)"),
         extended_thinking: z.boolean().optional().describe("If true, enables deeper reasoning (slower, better for complex tasks). Default false.")
       })
     },
     async ({ source_url, task, model, extended_thinking }) => {
-      const env = workerEnv;
-      if (!env) {
-        return { content: [{ type: "text", text: "env hâlâ yakalanamadı" }] };
-      }
-
-      const apiUrl = toGithubApiUrl(source_url);
-      const fetchUrl = apiUrl || source_url;
-
-      const fileRes = await fetch(fetchUrl, {
-        headers: {
-          Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-          Accept: "application/vnd.github.raw+json",
-          "User-Agent": "ai-router-worker"
+      try {
+        const env = workerEnv;
+        if (!env) {
+          return { content: [{ type: "text", text: "env hâlâ yakalanamadı" }] };
         }
-      });
-      if (!fileRes.ok) {
-        return { content: [{ type: "text", text: `Dosya çekilemedi: ${fileRes.status}` }] };
-      }
-      const fileContent = await fileRes.text();
+        if (!env.GITHUB_TOKEN || !env.GEMINI_API_KEY) {
+          return { content: [{ type: "text", text: "GITHUB_TOKEN veya GEMINI_API_KEY secret olarak eklenmemiş." }] };
+        }
 
-      const prompt = `${task}\n\nKısa ve öz cevap ver, sadece bulguları listele, dosyayı tekrar yazma.\n\n---DOSYA---\n${fileContent}`;
+        const apiUrl = toGithubApiUrl(source_url);
+        const fetchUrl = apiUrl || source_url;
 
-      const selectedModel = model || "gemini-3.6-flash";
-      const requestBody = {
-        contents: [{ parts: [{ text: prompt }] }]
-      };
-      if (extended_thinking) {
-        requestBody.generationConfig = {
-          thinkingConfig: { thinkingLevel: "high" }
+        const fileRes = await fetch(fetchUrl, {
+          headers: {
+            Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+            Accept: "application/vnd.github.raw+json",
+            "User-Agent": "ai-router-worker"
+          }
+        });
+        if (!fileRes.ok) {
+          return { content: [{ type: "text", text: `Dosya çekilemedi: ${fileRes.status}` }] };
+        }
+        const fileContent = await fileRes.text();
+
+        const prompt = `${task}\n\nKısa ve öz cevap ver, sadece bulguları listele, dosyayı tekrar yazma.\n\n---DOSYA---\n${fileContent}`;
+
+        const selectedModel = model || "gemini-3.6-flash";
+        const requestBody = {
+          contents: [{ parts: [{ text: prompt }] }]
         };
-      }
-
-      const geminiRes = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=${env.GEMINI_API_KEY}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(requestBody)
+        if (extended_thinking) {
+          requestBody.generationConfig = {
+            thinkingConfig: { thinkingLevel: "high" }
+          };
         }
-      );
 
-      if (!geminiRes.ok) {
-        const errText = await geminiRes.text();
-        return { content: [{ type: "text", text: `Gemini hata: ${geminiRes.status} — ${errText}` }] };
+        const geminiRes = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=${env.GEMINI_API_KEY}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(requestBody)
+          }
+        );
+
+        if (!geminiRes.ok) {
+          const errText = await geminiRes.text();
+          return { content: [{ type: "text", text: `Gemini hata: ${geminiRes.status} — ${errText}` }] };
+        }
+
+        const data = await geminiRes.json();
+        const answer = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "Gemini boş cevap döndü.";
+        return { content: [{ type: "text", text: answer }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `Beklenmedik hata: ${err.message ?? String(err)}` }] };
       }
-
-      const data = await geminiRes.json();
-      const answer = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "Gemini boş cevap döndü.";
-      return { content: [{ type: "text", text: answer }] };
     }
   );
 
