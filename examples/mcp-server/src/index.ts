@@ -1,3 +1,5 @@
+import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
+import { z } from "zod";
 // ============================================================
 // AI Router — index.ts (genişletilmiş sürüm)
 // ⚠️ DOSYANIN EN ÜSTÜNDEKİ import satırlarını (createMcpHandler, McpServer, z)
