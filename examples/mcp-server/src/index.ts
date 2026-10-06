@@ -217,9 +217,15 @@ async function generate(chain: string[], prompt: string, o: GenOpts, media?: Med
         if (p.executableCode?.code) answer += `\n\n[kod]\n${p.executableCode.code}`;
         if (p.codeExecutionResult?.output) answer += `\n[çıktı]\n${p.codeExecutionResult.output}`;
       }
+      // Boş cevap = başarı sayılmaz, sıradaki modeli dene
+      if (!answer.trim()) {
+        skipped.push(model);
+        errors.push(`${model} → boş cevap`);
+        continue;
+      }
       return {
         ok: true,
-        answer: answer.trim() || "Gemini boş cevap döndü.",
+        answer: answer.trim(),
         usedModel: model,
         skipped,
         notes,
@@ -359,19 +365,21 @@ function collectText(node: any, out: string[] = []): string[] {
   return out;
 }
 
+// Test: gemini-3.5-transcribe generateContent'te boş cevap veriyor, flash modeller kusursuz yazıya döküyor → flash önde, transcribe son çare
 const TRANSCRIBE_CHAIN = [
-  "gemini-3.5-transcribe", // 25/gün
   "gemini-3.8-flash",
   "gemini-3.7-flash",
+  "gemini-3.6-flash",
   "gemini-3.5-flash",
   "gemini-3.1-flash-lite",
+  "gemini-3.5-transcribe", // 25/gün
 ];
 
 const AGENT_MODEL = "antigravity-preview-09-2026"; // free: 100/gün
 
 // ── MCP server ────────────────────────────────────────────────
 function createServer() {
-  const server = new McpServer({ name: "ai-router", version: "2.3.1" });
+  const server = new McpServer({ name: "ai-router", version: "2.3.2" });
 
   server.registerTool(
     "hello",
@@ -518,7 +526,7 @@ function createServer() {
     "transcribe",
     {
       description:
-        "Speech-to-text from a PUBLIC https audio URL (max 3MB, e.g. mp3/wav/m4a/ogg). Uses gemini-3.5-transcribe (25/day), falls back to flash models.",
+        "Speech-to-text from a PUBLIC https audio URL (max 3MB, e.g. mp3/wav/m4a/ogg). Uses flash models (best quality in tests), gemini-3.5-transcribe as last resort.",
       inputSchema: z.object({
         audio_url: z.string().describe("Public https URL of the audio file"),
         language: z.string().optional().describe("Hint, e.g. 'Turkish'"),
