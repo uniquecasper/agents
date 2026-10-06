@@ -34,7 +34,8 @@ const TEXT_ALIASES: Record<string, string[]> = {
 
 const DEFAULT_TEXT = "flash";
 const EMBED_MODELS = ["gemini-embedding-2", "gemini-embedding-001"];
-const RETRY_STATUSES = new Set([404, 429, 500, 503]);
+// 502/504/524 = geçici gateway/timeout hataları (524: Cloudflare, model yanıt vermedi) → sıradaki modele geç
+const RETRY_STATUSES = new Set([404, 429, 500, 502, 503, 504, 524]);
 
 // ── Ayar tipleri ──────────────────────────────────────────────
 type ThinkingLevel = "minimal" | "low" | "medium" | "high";
@@ -379,7 +380,7 @@ const AGENT_MODEL = "antigravity-preview-09-2026"; // free: 100/gün
 
 // ── MCP server ────────────────────────────────────────────────
 function createServer() {
-  const server = new McpServer({ name: "ai-router", version: "2.3.2" });
+  const server = new McpServer({ name: "ai-router", version: "2.3.3" });
 
   server.registerTool(
     "hello",
