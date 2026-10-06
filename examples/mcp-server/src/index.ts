@@ -60,8 +60,8 @@ const PROFILES: Record<string, { model?: string; opts: GenOpts }> = {
   deep: { opts: { thinkingLevel: "high" } },
   // Kod/hesap: orta düşünme + Python çalıştırma
   code: { opts: { thinkingLevel: "medium", codeExecution: true } },
-  // Web: Google Search + verilen linkleri okuma (Gemini 3'te free tier'da Search kapalı olabilir)
-  web: { opts: { thinkingLevel: "medium", googleSearch: true, urlContext: true } },
+  // Web: verilen linkleri okuma. Google Search free tier'da Gemini 3'te kapalı (429) — istersen google_search=true ile aç
+  web: { opts: { thinkingLevel: "medium", urlContext: true } },
   // Yapılandırılmış çıktı: sadece JSON döner
   json: { opts: { thinkingLevel: "low", json: true } },
 };
@@ -72,7 +72,7 @@ const optionShape = {
     .enum(["fast", "deep", "code", "web", "json"])
     .optional()
     .describe(
-      "fast: quick/short. deep: full reasoning. code: Python execution. web: Google Search + URL reading. json: JSON-only output."
+      "fast: quick/short. deep: full reasoning. code: Python execution. web: reads URLs in the prompt (Google Search is opt-in via google_search=true). json: JSON-only output."
     ),
   system_instruction: z.string().optional().describe("Tone/role instructions for the model"),
   temperature: z.number().min(0).max(2).optional(),
@@ -186,13 +186,16 @@ async function generate(chain: string[], prompt: string, o: GenOpts): Promise<Ge
     try {
       res = await post(model, key, buildBody(model, prompt, o, false));
 
-      // Model thinking/search ayarını reddettiyse (400/403): ayarsız bir kez daha dene
-      if (!res.ok && (res.status === 400 || res.status === 403) && (o.thinkingLevel || o.googleSearch)) {
+      // Model thinking/search ayarını reddettiyse (400/403) ya da search kotası free tier'da 0 ise (429):
+      // ayarsız bir kez daha dene. Retry'ın cevabı esas alınır (ör. retry 429 ise sıradaki modele geçilir).
+      const stripCandidate =
+        !res.ok &&
+        ((o.thinkingLevel && (res.status === 400 || res.status === 403)) ||
+          (o.googleSearch && (res.status === 400 || res.status === 403 || res.status === 429)));
+      if (stripCandidate) {
         const retry = await post(model, key, buildBody(model, prompt, o, true));
-        if (retry.ok) {
-          res = retry;
-          notes.push(`${model}: thinking/search ayarı reddedildi, çıkarılıp çalıştırıldı`);
-        }
+        if (retry.ok) notes.push(`${model}: thinking/search ayarı çıkarılıp çalıştırıldı`);
+        res = retry;
       }
     } catch (err: any) {
       skipped.push(model);
@@ -237,7 +240,7 @@ function formatResult(r: GenResult, profile?: string): string {
 
 // ── MCP server ────────────────────────────────────────────────
 function createServer() {
-  const server = new McpServer({ name: "ai-router", version: "2.2.0" });
+  const server = new McpServer({ name: "ai-router", version: "2.2.1" });
 
   server.registerTool(
     "hello",
