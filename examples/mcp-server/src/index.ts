@@ -301,7 +301,19 @@ async function fetchMedia(
   for (let i = 0; i < buf.length; i += chunk) {
     bin += String.fromCharCode.apply(null, Array.from(buf.subarray(i, i + chunk)));
   }
-  const mime = (mimeOverride ?? res.headers.get("content-type") ?? "application/octet-stream").split(";")[0].trim();
+  let mime = (mimeOverride ?? res.headers.get("content-type") ?? "application/octet-stream").split(";")[0].trim().toLowerCase();
+  // Bazı sunucular ses dosyalarını genel/eski MIME ile gönderiyor; Gemini bunları reddediyor
+  const MIME_FIX: Record<string, string> = {
+    "application/ogg": "audio/ogg",
+    "application/x-ogg": "audio/ogg",
+    "audio/x-wav": "audio/wav",
+    "audio/wave": "audio/wav",
+    "audio/x-mpeg": "audio/mpeg",
+    "audio/mp3": "audio/mpeg",
+    "audio/x-m4a": "audio/mp4",
+    "audio/m4a": "audio/mp4",
+  };
+  mime = MIME_FIX[mime] ?? mime;
   return { ok: true, media: { mime, data: btoa(bin) } };
 }
 
@@ -359,7 +371,7 @@ const AGENT_MODEL = "antigravity-preview-09-2026"; // free: 100/gün
 
 // ── MCP server ────────────────────────────────────────────────
 function createServer() {
-  const server = new McpServer({ name: "ai-router", version: "2.3.0" });
+  const server = new McpServer({ name: "ai-router", version: "2.3.1" });
 
   server.registerTool(
     "hello",
