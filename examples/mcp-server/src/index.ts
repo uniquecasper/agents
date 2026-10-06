@@ -2,7 +2,7 @@ import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 // ─────────────────────────────────────────────────────────────
-// AI Router v2.3 — profiller + detaylı ayarlar + free-tier fallback + medya/ajan/embedding araçları
+// AI Router v2.4 — profiller + detaylı ayarlar + free-tier fallback + medya/ajan/embedding araçları
 //
 // profile:  fast | deep | code | web | json   (hepsi opsiyonel)
 // override: system_instruction, temperature, top_p, max_output_tokens,
@@ -376,11 +376,27 @@ const TRANSCRIBE_CHAIN = [
   "gemini-3.5-transcribe", // 25/gün
 ];
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// Interactions API cevabından final metni çıkar (output_text yoksa steps içinden)
+function agentOutput(data: any, raw: string): string {
+  let out: string = data?.output_text ?? "";
+  if (!out && Array.isArray(data?.steps)) {
+    for (let i = data.steps.length - 1; i >= 0 && !out; i--) out = collectText(data.steps[i]).join("\n");
+  }
+  if (!out) out = `(düz metin bulunamadı) ${raw.slice(0, 2000)}`;
+  if (out.length > 20000) out = out.slice(0, 20000) + "\n…(kesildi)";
+  return out;
+}
+
+const agentFooter = (data: any) =>
+  `— agent: ${AGENT_MODEL} | interaction_id: ${data?.id ?? "?"} | environment_id: ${data?.environment_id ?? "?"}`;
+
 const AGENT_MODEL = "antigravity-preview-09-2026"; // free: 100/gün
 
 // ── MCP server ────────────────────────────────────────────────
 function createServer() {
-  const server = new McpServer({ name: "ai-router", version: "2.3.3" });
+  const server = new McpServer({ name: "ai-router", version: "2.4.0" });
 
   server.registerTool(
     "hello",
@@ -627,11 +643,12 @@ function createServer() {
     "run_agent",
     {
       description:
-        "EXPERIMENTAL. Run Google's Antigravity managed agent (Linux sandbox: writes/runs code, files, web). Free: 100/day, so use for real multi-step tasks only. Returns the agent's final answer + interaction_id/environment_id to continue the same session. Can take minutes.",
+        "EXPERIMENTAL. Run Google's Antigravity managed agent (Linux sandbox: writes/runs code, files, web). Free: 100/day, use for real multi-step tasks only. Runs in BACKGROUND: waits up to ~80s; if not finished, returns an interaction_id — call agent_status with it to fetch the result later. Pass previous_interaction_id/environment_id to continue the same session.",
       inputSchema: z.object({
         task: z.string(),
         previous_interaction_id: z.string().optional().describe("Continue a conversation"),
         environment_id: z.string().optional().describe("Reuse the same sandbox (files persist)"),
+        wait_seconds: z.number().int().min(0).max(85).optional().describe("How long to wait for the result (default 80, 0 = return id immediately)"),
       }),
     },
     async (args: any) => {
@@ -642,6 +659,7 @@ function createServer() {
           agent: AGENT_MODEL,
           input: [{ type: "text", text: args.task }],
           environment: args.environment_id ?? { type: "remote" },
+          background: true,
         };
         if (args.previous_interaction_id) body.previous_interaction_id = args.previous_interaction_id;
         const res = await fetch(`${GEMINI_BASE}/interactions`, {
@@ -657,13 +675,54 @@ function createServer() {
         } catch {
           return text(`Agent beklenmedik cevap: ${raw.slice(0, 400)}`);
         }
-        let out: string = data.output_text ?? "";
-        if (!out && Array.isArray(data.steps)) {
-          for (let i = data.steps.length - 1; i >= 0 && !out; i--) out = collectText(data.steps[i]).join("\n");
+
+        // Cloudflare ~100sn'de keser: 80sn'ye kadar bekle, bitmezse id döndür
+        const deadline = Date.now() + (args.wait_seconds ?? 80) * 1000;
+        let status: string = data.status ?? "in_progress";
+        while (status === "in_progress" && data.id && Date.now() < deadline) {
+          await sleep(4000);
+          const pr = await fetch(`${GEMINI_BASE}/interactions/${data.id}`, { headers: { "x-goog-api-key": key } });
+          const praw = await pr.text();
+          if (!pr.ok) break; // geçici hata — id ile agent_status'tan devam edilir
+          try {
+            data = JSON.parse(praw);
+          } catch {
+            break;
+          }
+          status = data.status ?? status;
         }
-        if (!out) out = `(düz metin bulunamadı) ${raw.slice(0, 2000)}`;
-        if (out.length > 20000) out = out.slice(0, 20000) + "\n…(kesildi)";
-        return text(`${out}\n\n— agent: ${AGENT_MODEL} | interaction_id: ${data.id ?? "?"} | environment_id: ${data.environment_id ?? "?"}`);
+
+        if (status === "completed") return text(`${agentOutput(data, JSON.stringify(data))}\n\n${agentFooter(data)}`);
+        if (status === "failed" || status === "cancelled") return text(`Agent ${status}.\n\n${agentFooter(data)}`);
+        return text(
+          `Agent hâlâ çalışıyor (status: ${status}). Birkaç dakika sonra agent_status ile sor.\n\n${agentFooter(data)}`
+        );
+      } catch (err: any) {
+        return text(`Beklenmedik hata: ${err?.message ?? String(err)}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "agent_status",
+    {
+      description:
+        "Check/fetch the result of a background run_agent interaction by interaction_id. Returns status, and the final answer when completed.",
+      inputSchema: z.object({ interaction_id: z.string() }),
+    },
+    async (args: any) => {
+      try {
+        const key = getKey();
+        if (!key) return text("GEMINI_API_KEY secret olarak eklenmemiş.");
+        const res = await fetch(`${GEMINI_BASE}/interactions/${encodeURIComponent(args.interaction_id)}`, {
+          headers: { "x-goog-api-key": key },
+        });
+        const raw = await res.text();
+        if (!res.ok) return text(`Status hata: ${res.status} — ${raw.slice(0, 400)}`);
+        const data: any = JSON.parse(raw);
+        const status: string = data.status ?? "?";
+        if (status === "completed") return text(`${agentOutput(data, raw)}\n\n${agentFooter(data)}`);
+        return text(`status: ${status}\n\n${agentFooter(data)}`);
       } catch (err: any) {
         return text(`Beklenmedik hata: ${err?.message ?? String(err)}`);
       }
