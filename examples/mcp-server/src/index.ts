@@ -2,13 +2,17 @@ import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 // ─────────────────────────────────────────────────────────────
-// AI Router v2.4 — profiller + detaylı ayarlar + free-tier fallback + medya/ajan/embedding araçları
+// AI Router v2.5 — profiller + detaylı ayarlar + free-tier fallback + medya/ajan/embedding araçları
+//                  + itch.io (sadece okuma) + secret path kilidi
 //
 // profile:  fast | deep | code | web | json   (hepsi opsiyonel)
 // override: system_instruction, temperature, top_p, max_output_tokens,
 //           thinking_level, stop_sequences, google_search,
 //           code_execution, url_context, json_mode
 // Öncelik:  açık verilen parametre > profil > API varsayılanı
+//
+// GÜVENLİK: endpoint artık /mcp/<MCP_PATH_TOKEN> adresinde. Token yoksa/yanlışsa 404.
+// MCP_PATH_TOKEN secret'ı yoksa worker KAPALI başlar (fail-closed).
 // ─────────────────────────────────────────────────────────────
 
 let workerEnv: any;
@@ -394,9 +398,56 @@ const agentFooter = (data: any) =>
 
 const AGENT_MODEL = "antigravity-preview-09-2026"; // free: 100/gün
 
+// ── itch.io (SADECE OKUMA) ────────────────────────────────────
+// GÜVENLİK: ITCH_API_KEY sadece api.itch.io'ya, sadece GET ile gider. Yazma/yayın tool'u YOK.
+// Not: endpoint yolları itch'in v2 profil API'sine göre yazıldı; ilk test itch_me ile yapılmalı.
+const ITCH_BASE = "https://api.itch.io";
+
+async function itchGet(path: string): Promise<{ ok: true; data: any } | { ok: false; error: string }> {
+  const key = workerEnv?.ITCH_API_KEY;
+  if (!key) return { ok: false, error: "ITCH_API_KEY secret olarak eklenmemiş." };
+  const res = await fetch(`${ITCH_BASE}${path}`, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      Accept: "application/json",
+      "User-Agent": "ai-router-worker",
+    },
+  });
+  const raw = await res.text();
+  if (!res.ok) return { ok: false, error: `itch hata: ${res.status} — ${raw.slice(0, 300)}` };
+  try {
+    return { ok: true, data: JSON.parse(raw) };
+  } catch {
+    return { ok: false, error: `itch beklenmedik cevap: ${raw.slice(0, 300)}` };
+  }
+}
+
+const clip = (v: any, max = 8000): string => {
+  const s = JSON.stringify(v, null, 1);
+  return s.length > max ? `${s.slice(0, max)}\n…(kesildi)` : s;
+};
+
+const slimGame = (g: any) =>
+  g
+    ? {
+        id: g.id,
+        title: g.title,
+        url: g.url,
+        short_text: g.short_text,
+        type: g.type,
+        classification: g.classification,
+        published_at: g.published_at,
+        min_price: g.min_price,
+        views_count: g.views_count,
+        downloads_count: g.downloads_count,
+        purchases_count: g.purchases_count,
+      }
+    : null;
+
 // ── MCP server ────────────────────────────────────────────────
 function createServer() {
-  const server = new McpServer({ name: "ai-router", version: "2.4.0" });
+  const server = new McpServer({ name: "ai-router", version: "2.5.0" });
 
   server.registerTool(
     "hello",
@@ -729,14 +780,100 @@ function createServer() {
     }
   );
 
+  // ── itch.io tool'ları (sadece okuma) ────────────────────────
+  server.registerTool(
+    "itch_me",
+    {
+      description:
+        "itch.io: the connected account's profile (read-only). Also the quick test that ITCH_API_KEY works.",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      try {
+        const r = await itchGet("/profile");
+        if (!r.ok) return text(r.error);
+        return text(clip(r.data?.user ?? r.data));
+      } catch (err: any) {
+        return text(`Beklenmedik hata: ${err?.message ?? String(err)}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "itch_my_games",
+    {
+      description:
+        "itch.io: games the connected account has published (read-only): title, url, short text, type, view/download/purchase counts.",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      try {
+        const r = await itchGet("/profile/games");
+        if (!r.ok) return text(r.error);
+        const games: any[] = r.data?.games ?? [];
+        if (!games.length) return text("Yayınlanmış oyun bulunamadı.");
+        return text(clip(games.map(slimGame)));
+      } catch (err: any) {
+        return text(`Beklenmedik hata: ${err?.message ?? String(err)}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    "itch_owned_keys",
+    {
+      description:
+        "itch.io: games in the connected account's library (purchased/claimed download keys), read-only. page: 1-based, optional.",
+      inputSchema: z.object({ page: z.number().int().positive().optional() }),
+    },
+    async ({ page }: { page?: number }) => {
+      try {
+        const r = await itchGet(`/profile/owned-keys?page=${page ?? 1}`);
+        if (!r.ok) return text(r.error);
+        const keys: any[] = r.data?.owned_keys ?? [];
+        if (!keys.length) return text("Bu sayfada kütüphane kaydı yok.");
+        return text(
+          clip(
+            keys.map((k: any) => ({
+              acquired: k.created_at,
+              game: slimGame(k.game),
+            }))
+          )
+        );
+      } catch (err: any) {
+        return text(`Beklenmedik hata: ${err?.message ?? String(err)}`);
+      }
+    }
+  );
+
   return server;
+}
+
+// ── Secret path kilidi ────────────────────────────────────────
+// İstek /mcp/<MCP_PATH_TOKEN>[/...] değilse 404. Token yoksa veya 24 karakterden kısaysa
+// worker tamamen kapalı (fail-closed). Geçerli istek içeride /mcp[/...] olarak yeniden yazılır.
+const MIN_TOKEN_LEN = 24;
+
+function gate(args: any[]): { res?: Response; args: any[] } {
+  const req = args[0];
+  if (!(req instanceof Request)) return { args };
+  const token: string | undefined = args[1]?.MCP_PATH_TOKEN;
+  const deny = () => ({ res: new Response("Not found", { status: 404 }), args });
+  if (!token || token.length < MIN_TOKEN_LEN) return deny();
+  const url = new URL(req.url);
+  const prefix = `/mcp/${token}`;
+  if (url.pathname !== prefix && !url.pathname.startsWith(`${prefix}/`)) return deny();
+  url.pathname = `/mcp${url.pathname.slice(prefix.length)}`;
+  return { args: [new Request(url.toString(), req), ...args.slice(1)] };
 }
 
 // ── Env yakalama (Proxy) ──────────────────────────────────────
 function captureEnv(fn: Function, boundTo: any) {
   return function (...args: any[]) {
     if (args.length >= 2) workerEnv = args[1];
-    return fn.apply(boundTo, args);
+    const g = gate(args);
+    if (g.res) return g.res;
+    return fn.apply(boundTo, g.args);
   };
 }
 
@@ -745,7 +882,9 @@ const rawHandler: any = createMcpHandler(createServer);
 export default new Proxy(rawHandler, {
   apply(target, thisArg, args) {
     if (args.length >= 2) workerEnv = args[1];
-    return Reflect.apply(target, thisArg, args);
+    const g = gate(args);
+    if (g.res) return g.res;
+    return Reflect.apply(target, thisArg, g.args);
   },
   get(target, prop, receiver) {
     const value = Reflect.get(target, prop, receiver);
