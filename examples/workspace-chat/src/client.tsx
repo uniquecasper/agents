@@ -124,6 +124,7 @@ const FileBrowser = forwardRef<
 
   useEffect(() => {
     if (isConnected) {
+      // oxlint-disable-next-line react/set-state-in-effect -- (re)load from the agent whenever the connection opens; showing the loading state first is intended
       loadDir(currentPath);
       loadInfo();
     }
@@ -450,8 +451,8 @@ function Chat() {
                 <span className="mt-1 block">
                   <Text size="xs" variant="secondary">
                     An AI assistant with a persistent virtual filesystem. Ask it
-                    to create files, write code, explore the workspace, or use
-                    the isolate-backed state runtime for multi-file refactors.
+                    to create files, write code, explore the workspace, or run
+                    JavaScript against it with exec for multi-file work and git.
                     Files persist across conversations.
                   </Text>
                 </span>
@@ -467,7 +468,7 @@ function Chat() {
               <Empty
                 icon={<TerminalIcon size={32} />}
                 title="Start building"
-                description='Try "Create a hello world HTML page" or "Use the state runtime to rename foo to bar across /src/**/*.ts"'
+                description='Try "Create a hello world HTML page" or "Rename foo to bar across /workspace/src"'
               />
             )}
 
@@ -683,7 +684,7 @@ function Chat() {
                     send();
                   }
                 }}
-                placeholder='Try: "Plan edits for /src/config.json and apply them with the state runtime"'
+                placeholder='Try: "Initialise a git repo in /workspace and commit everything"'
                 disabled={!isConnected || isStreaming}
                 rows={2}
                 className="flex-1 !ring-0 focus:!ring-0 !shadow-none !bg-transparent !outline-none"

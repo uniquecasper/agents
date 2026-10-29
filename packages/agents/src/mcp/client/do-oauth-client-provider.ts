@@ -6,6 +6,7 @@ import type {
   StoredOAuthClientInformation,
   StoredOAuthTokens
 } from "@modelcontextprotocol/client";
+import { validateClientMetadataUrl } from "@modelcontextprotocol/client";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { nanoid } from "nanoid";
 
@@ -88,21 +89,53 @@ function isExpired(createdAt: number): boolean {
  */
 export type AgentsOAuthProvider = AgentMcpOAuthProvider;
 
+export interface DurableObjectOAuthClientProviderOptions {
+  /**
+   * HTTPS URL of this client's OAuth Client ID Metadata Document.
+   *
+   * When an authorization server advertises
+   * `client_id_metadata_document_supported`, the client uses this URL as its
+   * `client_id` instead of dynamic client registration. Other servers still
+   * use dynamic client registration. Serve
+   * {@link DurableObjectOAuthClientProvider.clientMetadataDocument} at this
+   * URL, and use a stable `callbackPath` so the document's `redirect_uris`
+   * match every authorization request.
+   */
+  clientMetadataUrl?: string;
+}
+
 export class DurableObjectOAuthClientProvider implements AgentMcpOAuthProvider {
   private _authUrl_: string | undefined;
   private _serverId_: string | undefined;
   private _clientId_: string | undefined;
+  readonly clientMetadataUrl: string | undefined;
 
   constructor(
     public storage: DurableObjectStorage,
     public clientName: string,
-    public baseRedirectUrl: string
+    public baseRedirectUrl: string,
+    options: DurableObjectOAuthClientProviderOptions = {}
   ) {
     if (!storage) {
       throw new Error(
         "DurableObjectOAuthClientProvider requires a valid DurableObjectStorage instance"
       );
     }
+    validateClientMetadataUrl(options.clientMetadataUrl);
+    this.clientMetadataUrl = options.clientMetadataUrl || undefined;
+  }
+
+  /**
+   * The Client ID Metadata Document to serve at `clientMetadataUrl`.
+   * Throws when the provider has no `clientMetadataUrl`.
+   */
+  get clientMetadataDocument(): OAuthClientMetadata & { client_id: string } {
+    if (!this.clientMetadataUrl) {
+      throw new Error(
+        "clientMetadataDocument requires a clientMetadataUrl option"
+      );
+    }
+    return { client_id: this.clientMetadataUrl, ...this.clientMetadata };
   }
 
   get clientMetadata(): OAuthClientMetadata {
@@ -352,6 +385,25 @@ export class DurableObjectOAuthClientProvider implements AgentMcpOAuthProvider {
 
     if (deleteKeys.length > 0) {
       await this.storage.delete([...new Set(deleteKeys)]);
+    }
+  }
+
+  /**
+   * Delete every key this provider stores for its server: tokens and client
+   * info for any client ID, verifiers, pending states and discovery state.
+   * Used when the server is removed. Other servers' keys are untouched.
+   */
+  async clearServerStorage(): Promise<void> {
+    const keys = [
+      ...(
+        await this.storage.list({
+          prefix: `/${this.clientName}/${this.serverId}/`
+        })
+      ).keys()
+    ];
+    // DO storage caps a multi-key delete at 128 keys.
+    for (let i = 0; i < keys.length; i += 128) {
+      await this.storage.delete(keys.slice(i, i + 128));
     }
   }
 

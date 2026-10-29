@@ -1,5 +1,7 @@
 import { Agent, callable, getCurrentAgent } from "../../index.ts";
 import type {
+  Connection,
+  WSMessage,
   FiberInspection,
   FiberRecoveryContext,
   FiberRecoveryResult,
@@ -7,6 +9,9 @@ import type {
 } from "../../index.ts";
 import { RpcTarget } from "cloudflare:workers";
 import { MessageType } from "../../types.ts";
+import type { Tasks } from "../../tasks/tasks.ts";
+
+const STALE_FRAME_PROBE = "stale-frame-probe";
 
 // ── SubAgent: Counter ───────────────────────────────────────────────
 // A SubAgent with its own SQLite counter table.
@@ -68,6 +73,9 @@ export class CounterSubAgent extends Agent {
       VALUES
         (${ctx.id}, ${ctx.name}, ${JSON.stringify(ctx.snapshot)}, ${ctx.createdAt})
     `;
+    if (ctx.name === "recovery-throws") {
+      throw new Error("recovery hook failed");
+    }
     if (ctx.name === "managed-recovery-complete") {
       return { status: "completed", snapshot: { recovered: true } };
     }
@@ -95,6 +103,10 @@ export class CounterSubAgent extends Agent {
     return rows.length > 0 ? rows[0].value : 0;
   }
 
+  onMessage(_connection: Connection, message: WSMessage) {
+    if (message === STALE_FRAME_PROBE) this.increment(STALE_FRAME_PROBE);
+  }
+
   ping(): string {
     return "pong";
   }
@@ -110,6 +122,18 @@ export class CounterSubAgent extends Agent {
       VALUES
         (${payload.value}, ${this.name}, ${agent?.name ?? null}, ${this.parentPath.at(-1)?.className ?? ""}, ${schedule.id}, ${schedule.callback})
     `;
+  }
+
+  /** Queue callback: logs like scheduledCallback so the same reader works. */
+  queuedCallback(
+    payload: { value: string },
+    item: { id: string; callback: string }
+  ): void {
+    this.scheduledCallback(payload, item);
+  }
+
+  async queueCallback(value: string): Promise<string> {
+    return this.queue("queuedCallback", { value });
   }
 
   async scheduleDelayedCallback(
@@ -391,6 +415,29 @@ export class CounterSubAgent extends Agent {
     return id;
   }
 
+  async runFiberWithFailingCleanup(
+    value: string,
+    failBody = false
+  ): Promise<string> {
+    this.sql`
+      CREATE TRIGGER fail_run_fiber_cleanup
+      BEFORE DELETE ON cf_agents_runs
+      BEGIN
+        SELECT RAISE(FAIL, 'simulated fiber cleanup failure');
+      END
+    `;
+    try {
+      return await this.runFiber("cleanup-failure", async () => {
+        if (failBody) throw new Error(value);
+        return value;
+      });
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    } finally {
+      this.sql`DROP TRIGGER fail_run_fiber_cleanup`;
+    }
+  }
+
   async holdManagedFiber(value: string, key: string): Promise<string> {
     const result = await this.startFiber(
       "managed-held",
@@ -481,6 +528,18 @@ export class CounterSubAgent extends Agent {
       SELECT COUNT(*) as count FROM cf_agents_runs
     `;
     return rows[0]?.count ?? 0;
+  }
+
+  getLocalJobIds(): string[] {
+    return this.lifecycle.jobs.list().map((job) => job.id);
+  }
+
+  /** Persist a host job row the way a failed pre-#2299 facet push left it. */
+  insertStaleHostJob(id: string, fn: string): void {
+    this.sql`
+      INSERT INTO cf_agents_jobs (id, capability, fn, time)
+      VALUES (${id}, 'host', ${fn}, ${Date.now()})
+    `;
   }
 
   async inspectManagedFiber(fiberId: string): Promise<FiberInspection | null> {
@@ -886,6 +945,14 @@ export class OuterSubAgent extends Agent {
     await this.subAgent(InnerSubAgent, innerName);
   }
 
+  async deleteInner(innerName: string): Promise<void> {
+    await this.deleteSubAgent(InnerSubAgent, innerName);
+  }
+
+  hasInner(innerName: string): boolean {
+    return this.hasSubAgent(InnerSubAgent, innerName);
+  }
+
   ping(): string {
     return "outer-pong";
   }
@@ -1180,11 +1247,40 @@ export class TestSubAgentParent extends Agent {
     this._subAgentBroadcastFailuresRemaining += 1;
   }
 
+  private _subAgentBroadcastCalls = 0;
+  private _startsInThisInstance = 0;
+
+  onStart(): void {
+    this._startsInThisInstance += 1;
+  }
+
+  /** Read without an RPC so the probe itself cannot start the agent. */
+  get startsInThisInstance(): number {
+    return this._startsInThisInstance;
+  }
+
+  subAgentBroadcastCallCount(): number {
+    return this._subAgentBroadcastCalls;
+  }
+
+  async broadcastFromSubAgentDetached(
+    childName: string,
+    messages: string[]
+  ): Promise<void> {
+    const child = await this.subAgent(SlowReplySubAgent, childName);
+    await child.broadcastDetached(messages);
+  }
+
+  abortSlowReplySubAgent(childName: string): void {
+    this.abortSubAgent(SlowReplySubAgent, childName);
+  }
+
   override async _cf_broadcastToSubAgent(
     ownerPath: ReadonlyArray<{ className: string; name: string }>,
     message: string | ArrayBuffer | ArrayBufferView,
     without?: string[]
   ): Promise<void> {
+    this._subAgentBroadcastCalls += 1;
     if (this._subAgentBroadcastFailuresRemaining > 0) {
       this._subAgentBroadcastFailuresRemaining -= 1;
       throw new Error("TestSubAgentParent broadcast forwarding failed");
@@ -1340,6 +1436,44 @@ export class TestSubAgentParent extends Agent {
     await this.deleteSubAgent(CounterSubAgent, subAgentName);
   }
 
+  /**
+   * Deletes the child, recreates it under the same name, then forwards a
+   * frame from the socket the delete closed, as a late event would. Returns
+   * how many of those frames the replacement received.
+   */
+  async subAgentForwardStaleFrameToReplacement(
+    subAgentName: string
+  ): Promise<number> {
+    const sockets = (
+      this as unknown as {
+        _webSockets: { getConnections(): Iterable<Connection> };
+      }
+    )._webSockets.getConnections();
+    const connection = [...sockets].find((candidate) => {
+      const outerUrl = this._unsafe_getConnectionFlag(
+        candidate,
+        "_cf_subAgentOuterUrl"
+      );
+      return (
+        typeof outerUrl === "string" &&
+        outerUrl.includes(`/sub/counter-sub-agent/${subAgentName}`)
+      );
+    });
+    if (!connection) throw new Error("no socket for the sub-agent");
+
+    await this.deleteSubAgent(CounterSubAgent, subAgentName);
+    const replacement = await this.subAgent(CounterSubAgent, subAgentName);
+    await (
+      this as unknown as {
+        _cf_forwardSubAgentWebSocketMessage(
+          connection: Connection,
+          message: WSMessage
+        ): Promise<boolean>;
+      }
+    )._cf_forwardSubAgentWebSocketMessage(connection, STALE_FRAME_PROBE);
+    return replacement.get(STALE_FRAME_PROBE);
+  }
+
   async subAgentScheduleDelayed(
     subAgentName: string,
     delaySeconds: number,
@@ -1348,6 +1482,50 @@ export class TestSubAgentParent extends Agent {
   ): Promise<string> {
     const child = await this.subAgent(CounterSubAgent, subAgentName);
     return child.scheduleDelayedCallback(delaySeconds, value, options);
+  }
+
+  async subAgentQueue(subAgentName: string, value: string): Promise<string> {
+    const child = await this.subAgent(CounterSubAgent, subAgentName);
+    return child.queueCallback(value);
+  }
+
+  /**
+   * Queue from a facet, park the item in the far future so the alarm cannot
+   * run it, then delete the facet. Returns the root queue rows after each
+   * step so a test can assert the deletion cleaned the routed item up.
+   */
+  async subAgentQueueThenDelete(subAgentName: string): Promise<{
+    beforeDelete: string[];
+    afterDelete: string[];
+  }> {
+    const itemId = await this.subAgentQueue(subAgentName, "orphan");
+    this
+      .sql`UPDATE cf_agents_jobs SET time = ${Date.now() + 86_400_000} WHERE id = ${itemId}`;
+    const beforeDelete = (await this.rootQueueRows()).map((row) => row.id);
+    await this.deleteSubAgent(CounterSubAgent, subAgentName);
+    const afterDelete = (await this.rootQueueRows()).map((row) => row.id);
+    return { beforeDelete, afterDelete };
+  }
+
+  async rootQueueRows(): Promise<
+    Array<{ id: string; callback: string; ownerPath: string | null }>
+  > {
+    return this.sql<{
+      id: string;
+      callback: string;
+      owner_path: string | null;
+    }>`
+      SELECT id,
+             fn AS callback,
+             json_extract(payload, '$.owner_path') AS owner_path
+      FROM cf_agents_jobs
+      WHERE capability = 'queue'
+      ORDER BY time
+    `.map((row) => ({
+      id: row.id,
+      callback: row.callback,
+      ownerPath: row.owner_path
+    }));
   }
 
   async subAgentScheduleInterval(
@@ -1484,6 +1662,25 @@ export class TestSubAgentParent extends Agent {
   async backdateSchedule(id: string): Promise<void> {
     const past = Date.now() - 1_000;
     this.sql`UPDATE cf_agents_jobs SET time = ${past} WHERE id = ${id}`;
+  }
+
+  /** Drive a routed Task wake for a facet that is not in the registry. */
+  async driveStaleRoutedTaskWake(runId: string): Promise<string> {
+    const path = [
+      { className: "TestSubAgentParent", name: this.name },
+      { className: "CounterSubAgent", name: "gone-task-child" }
+    ];
+    const key = path
+      .map((p) => `${p.className}:${encodeURIComponent(p.name)}`)
+      .join("/");
+    const job = {
+      id: `task:${key}:${runId}`,
+      fn: "wake",
+      time: Date.now(),
+      payload: { runId, owner_path: JSON.stringify(path), owner_path_key: key }
+    } as unknown as Parameters<Tasks["onJob"]>[0]["job"];
+    const outcome = await this.tasks.onJob({ job, attempt: 1 });
+    return outcome === undefined ? "undefined" : JSON.stringify(outcome);
   }
 
   async forgetCounterSubAgentRegistry(subAgentName: string): Promise<void> {
@@ -1749,6 +1946,16 @@ export class TestSubAgentParent extends Agent {
     await outer.spawnInner(innerName);
   }
 
+  async nestedDeleteInner(outerName: string, innerName: string): Promise<void> {
+    const outer = await this.subAgent(OuterSubAgent, outerName);
+    await outer.deleteInner(innerName);
+  }
+
+  async nestedHasInner(outerName: string, innerName: string): Promise<boolean> {
+    const outer = await this.subAgent(OuterSubAgent, outerName);
+    return outer.hasInner(innerName);
+  }
+
   async nestedSpawnWithFacetParentNamespaceHidden(
     outerName: string,
     innerName: string
@@ -1854,6 +2061,15 @@ export class TestSubAgentParent extends Agent {
     return child.inspectManagedFiber(fiberId);
   }
 
+  async subAgentRunFiberWithFailingCleanup(
+    subAgentName: string,
+    value: string,
+    failBody = false
+  ): Promise<string> {
+    const child = await this.subAgent(CounterSubAgent, subAgentName);
+    return child.runFiberWithFailingCleanup(value, failBody);
+  }
+
   async subAgentRunningFiberCount(subAgentName: string): Promise<number> {
     const child = await this.subAgent(CounterSubAgent, subAgentName);
     return child.getRunningFiberCount();
@@ -1924,6 +2140,23 @@ export class TestSubAgentParent extends Agent {
   async subAgentTryCancelSchedule(subAgentName: string): Promise<string> {
     const child = await this.subAgent(CounterSubAgent, subAgentName);
     return child.tryCancelSchedule();
+  }
+
+  async subAgentInsertStaleHostJob(
+    subAgentName: string,
+    id: string,
+    fn: string
+  ): Promise<void> {
+    const child = await this.subAgent(CounterSubAgent, subAgentName);
+    await child.insertStaleHostJob(id, fn);
+  }
+
+  async subAgentLocalJobIdsAfterRestart(
+    subAgentName: string
+  ): Promise<string[]> {
+    this.abortSubAgent(CounterSubAgent, subAgentName);
+    const child = await this.subAgent(CounterSubAgent, subAgentName);
+    return child.getLocalJobIds();
   }
 
   async subAgentTryScheduleAfterAbort(subAgentName: string): Promise<string> {
@@ -2294,8 +2527,15 @@ export class HookingSubAgentParent extends Agent {
     `;
   }
 
+  @callable()
   async setHookMode(
-    mode: "allow" | "deny-404" | "deny-401" | "mutate" | "strict-registry"
+    mode:
+      | "allow"
+      | "deny-404"
+      | "deny-401"
+      | "deny-503"
+      | "mutate"
+      | "strict-registry"
   ): Promise<void> {
     this.sql`UPDATE hook_mode SET value = ${mode} WHERE id = 1`;
   }
@@ -2339,6 +2579,10 @@ export class HookingSubAgentParent extends Agent {
       });
     }
 
+    if (mode === "deny-503") {
+      return new Response("unavailable", { status: 503 });
+    }
+
     if (mode === "mutate") {
       // Inject a header and pass through.
       const headers = new Headers(req.headers);
@@ -2368,6 +2612,16 @@ export class HookingSubAgentParent extends Agent {
       SELECT url FROM last_url WHERE id = 1
     `;
     return rows[0]?.url ?? null;
+  }
+}
+
+// ── Facet that rejects every child request ──────────────────────────
+// Pins how a gate at a nested hop rejects a WebSocket the root already
+// accepted.
+
+export class DenyingSubAgent extends Agent {
+  override async onBeforeSubAgent(): Promise<Response> {
+    return new Response("forbidden", { status: 403 });
   }
 }
 
@@ -2499,6 +2753,39 @@ export class SlowReplySubAgent extends Agent {
   broadcastMessageNow(message: string): string {
     this.broadcast(message);
     return "broadcast";
+  }
+
+  /** Broadcasts and then sends directly, both during the current frame. */
+  @callable()
+  broadcastThenSendNow(broadcast: string, direct: string): string {
+    const { connection } = getCurrentAgent();
+    if (!connection) {
+      throw new Error(
+        "SlowReplySubAgent.broadcastThenSendNow requires an active connection"
+      );
+    }
+
+    this.broadcast(broadcast);
+    connection.send(direct);
+    return "sent";
+  }
+
+  /** Broadcasts after the current frame completes, optionally skipping the caller. */
+  @callable()
+  broadcastMessagesAfterDelay(messages: string[], withoutSelf = false): string {
+    const { connection } = getCurrentAgent();
+    const without = withoutSelf && connection ? [connection.id] : undefined;
+    this.ctx.waitUntil(
+      new Promise((resolve) => setTimeout(resolve, 50)).then(() => {
+        for (const message of messages) this.broadcast(message, without);
+      })
+    );
+    return "scheduled";
+  }
+
+  /** Broadcasts from a parent RPC, outside any client frame. */
+  broadcastDetached(messages: string[]): void {
+    for (const message of messages) this.broadcast(message);
   }
 
   /** Schedules consecutive messages after the current frame completes. */

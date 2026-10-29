@@ -21,6 +21,9 @@ export type LifecycleRouteContext = {
   readonly payload: unknown;
 };
 
+/** Startup state of a Lifecycle. */
+export type LifecycleStatus = "zero" | "starting" | "started";
+
 /** Best-effort telemetry available to every Lifecycle capability. */
 export type LifecycleEvents = {
   /** Publish an event under this capability's stable identity. */
@@ -66,15 +69,34 @@ export type LifecycleSockets = {
 
 /**
  * Standard services granted to every installed Lifecycle capability.
- *
- * @experimental The API surface may change before stabilizing.
  */
 export type LifecycleServices = {
+  /** The host's Durable Object name; see `Lifecycle.name`. */
+  readonly name: string;
+  /** The host class name, as exported from the Worker. */
+  readonly className: string;
   readonly storage: DurableObjectStorage;
   readonly sockets: LifecycleSockets;
+  /**
+   * Resolve once Lifecycle startup has finished, starting it if needed, and
+   * reject if that startup fails. Calls made from inside startup resolve
+   * immediately.
+   *
+   * Await it first in any operation that can run before startup and starts
+   * work `onStart` also awaits, such as lazily opening a store. Native RPC
+   * bypasses the automatic startup on fetch, alarm and WebSocket events, so
+   * such an operation can begin that work outside startup. `onStart` then
+   * awaits it while startup holds the input gate (`blockConcurrencyWhile`),
+   * which holds back the work's timers and I/O, and startup times out after
+   * 30 seconds and resets the object.
+   */
   readonly ready: () => Promise<void>;
-  /** True while capability and host startup hooks are still running. */
-  readonly starting: () => boolean;
+  /**
+   * Startup state: `"zero"` before startup, `"starting"` while capability
+   * and host startup hooks run, `"started"` once `ready()` resolves without
+   * waiting.
+   */
+  readonly status: () => LifecycleStatus;
   /**
    * This capability's scoped access to the Lifecycle-owned work queue.
    * Pushed items are dispatched to `onJob` when due; every queue mutation
@@ -106,11 +128,12 @@ const installedServices = new WeakMap<object, LifecycleServices>();
 
 /**
  * Base class for capabilities that consume standard Lifecycle services.
- *
- * @experimental The API surface may change before stabilizing.
  */
 export abstract class LifecycleCapability<Props extends object = object> {
   readonly capabilityId: string;
+
+  /** How this capability claims traffic; see {@link DurableObjectCapability.claims}. */
+  readonly claims: "selective" | "catch-all" = "selective";
 
   protected constructor(capabilityId: string) {
     if (capabilityId.trim() === "") {

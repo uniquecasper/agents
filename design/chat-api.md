@@ -2,13 +2,13 @@
 
 A critical analysis of the current `@cloudflare/ai-chat` API surface — both the server-side `AIChatAgent` class and the client-side `useAgentChat` React hook. Identifies pain points, awkward patterns, missing capabilities, and opportunities for improvement.
 
-> **Note:** The "Implications for Think" section was written before the Session integration design. For how Think addresses these issues with Session as its storage layer, see [think-roadmap.md](./think-roadmap.md). Several server-side issues (S3 message access helpers, X2 conversation management) are resolved by Session. The client-side issues (C1–C8) remain fully relevant — they affect `useAgentChat` regardless of server-side architecture.
+> **Note:** The "Implications for Think" section was written before the Session integration design. For how Think addresses these issues with Session as its storage layer, see [think.md](./think.md). Several server-side issues (S3 message access helpers, X2 conversation management) are resolved by Session. The client-side issues (C1–C8) remain fully relevant — they affect `useAgentChat` regardless of server-side architecture.
 
 Related:
 
 - [think-vs-aichat.md](./think-vs-aichat.md) — feature gap analysis between Think and AIChatAgent
 - [sessions.md](./sessions.md) — Session integration design for Think
-- [think-roadmap.md](./think-roadmap.md) — implementation plan (supersedes the prioritization in this doc)
+- [think-roadmap.md](./think-roadmap.md) — completed implementation plan, kept as a historical record
 
 ---
 
@@ -45,9 +45,7 @@ export class MyAgent extends AIChatAgent<Env> {
         messages: await convertToModelMessages(this.messages),
         toolCalls: "before-last-2-messages"
       }),
-      tools: {
-        /* ... */
-      },
+      tools: {/* ... */},
       abortSignal: options?.abortSignal
     });
     return result.toUIMessageStreamResponse();
@@ -415,10 +413,12 @@ The hook also uses `@ts-expect-error` to access internal `PartySocket` propertie
 ```typescript
 // packages/ai-chat/src/react.tsx, lines 469–474
 const agentUrl = new URL(
-  `${// @ts-expect-error we're using a protected _url property
-  ((agent._url as string | null) || agent._pkurl)
-    ?.replace("ws://", "http://")
-    .replace("wss://", "https://")}`
+  `${
+    // @ts-expect-error we're using a protected _url property
+    ((agent._url as string | null) || agent._pkurl)
+      ?.replace("ws://", "http://")
+      .replace("wss://", "https://")
+  }`
 );
 ```
 
@@ -689,7 +689,7 @@ This complexity is mostly internal and doesn't leak to users (the `resume: true`
 
 ## Implications for Think
 
-> **Updated:** The analysis below was written before Session integration. See [think-roadmap.md](./think-roadmap.md) for the current plan. Key changes:
+> **Updated:** The analysis below was written before Session integration. That work is complete; see [think.md](./think.md) for how Think works today and [think-roadmap.md](./think-roadmap.md) for the historical plan. Key changes:
 >
 > - Session solves S3 (message access helpers — `getMessage`, `getLatestLeaf`, `getBranches`, `getPathLength`)
 > - The parent-directory plus one-conversation-Durable-Object pattern solves X2; Sessions deliberately does not own the directory

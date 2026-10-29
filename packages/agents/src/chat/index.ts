@@ -1,6 +1,9 @@
 export {
   applyChunkToParts,
+  applyLateToolInput,
+  isLateToolInputChunk,
   isReplayChunk,
+  lateToolInputForwardChunks,
   normalizeToolInput,
   type MessageParts,
   type MessagePart,
@@ -23,6 +26,8 @@ export {
 } from "./stream-accumulator";
 
 export { TurnQueue, type TurnResult, type EnqueueOptions } from "./turn-queue";
+
+export { originMessageIds, withOriginMessageIds } from "./origin-message-ids";
 
 /**
  * @internal Shared text-segment separator for sibling streaming packages.
@@ -48,9 +53,7 @@ export {
 
 export {
   ResumableStream,
-  cleanupStreamBuffers,
   createChatStreams,
-  STREAM_CLEANUP_DELAY_SECONDS,
   type SqlTaggedTemplate
 } from "./resumable-stream";
 export {
@@ -75,7 +78,7 @@ export { MAX_BOUND_PARAMS, buildInClauseStrings } from "./sql-batch";
  * @internal Platform-failure classifier shared with the chat hosts'
  * queue-dispatch deferral (#1730); sibling-package support, not a public API.
  */
-export { isPlatformFailure } from "../retries";
+export { isPlatformFailure, isDurableObjectResetError } from "../retries";
 
 export {
   createToolsFromClientSchemas,
@@ -90,12 +93,17 @@ export {
 } from "./protocol";
 
 export { MessageType } from "./wire-types";
-export type { OutgoingMessage, IncomingMessage } from "./wire-types";
+export type {
+  ChatTurnOutcome,
+  OutgoingMessage,
+  IncomingMessage
+} from "./wire-types";
 
 export {
   applyAgentToolEvent,
   createAgentToolEventState,
   interceptAgentToolBroadcast,
+  isPositionlessAgentToolChunk,
   AgentToolProgressEmitter,
   type AgentToolProgressEmitHooks,
   type AgentToolProgressEmitResult,
@@ -214,6 +222,7 @@ export {
  */
 export {
   aiSdkRecoveryCodec,
+  partialHasSettledToolResults,
   shouldCreditStreamProgress,
   type ChatRecoveryCodec,
   type ProgressCreditThrottle
@@ -247,7 +256,7 @@ export {
   CHAT_LAST_TERMINAL_KEY,
   DEFAULT_CHAT_RECOVERY_MAX_ATTEMPTS,
   DEFAULT_CHAT_RECOVERY_MAX_WORK,
-  DEFAULT_CHAT_RECOVERY_MAX_OOM_RETRIES,
+  DEFAULT_CHAT_RECOVERY_MAX_INTERRUPTED_ATTEMPTS,
   DEFAULT_CHAT_RECOVERY_STABLE_TIMEOUT_MS,
   CHAT_RECOVERY_STABLE_RETRY_DELAY_SECONDS,
   DEFAULT_CHAT_RECOVERY_TERMINAL_MESSAGE,
@@ -259,6 +268,8 @@ export {
   type ChatTerminalRecord,
   type ChatRecoveryIncident,
   type ChatRecoveryKind,
+  type ChatRecoveryTrigger,
+  type ChatRecoveryAttempt,
   type ChatRecoveryIncidentEvent,
   type EvaluateChatRecoveryIncidentInput,
   type EvaluateChatRecoveryIncidentResult
@@ -267,6 +278,9 @@ export {
 export {
   ChatRecoveryEngine,
   runChatRecoveryExhaustion,
+  chatRecoveryBackoffSeconds,
+  retryAfterSeconds,
+  CHAT_RECOVERY_CANCELLED_REASON,
   type ChatRecoveryScheduleReason,
   type ChatRecoveryScheduleCallback,
   type ChatRecoveryAdapter,
@@ -302,5 +316,7 @@ export type {
 } from "./lifecycle";
 export {
   truncateOlderMessages,
-  type TruncateOptions
+  truncateOlderToolResults,
+  type TruncateOptions,
+  type TruncateToolResultsOptions
 } from "./truncate-older-messages";

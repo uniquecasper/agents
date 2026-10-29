@@ -1,5 +1,9 @@
+/**
+ * The legacy TanStack AI `createBrowserTools`. `agents/browser/tanstack-ai`
+ * (`tools/tanstack-ai.ts`) re-exports it until it's retired.
+ */
 import { toolDefinition } from "@tanstack/ai";
-import type { ServerTool } from "@tanstack/ai";
+import type { SchemaInput, ServerTool } from "@tanstack/ai";
 import type { ProxyToolOutput } from "@cloudflare/codemode";
 import { z } from "zod";
 import { createBrowserRuntime, type CreateBrowserToolsOptions } from "./ai";
@@ -36,10 +40,14 @@ export type { CreateBrowserToolsOptions } from "./ai";
  *   messages,
  * });
  * ```
+ *
+ * @deprecated Use `browserTool` from `agents/browser/ai-sdk`,
+ * `agents/browser/tanstack-ai` or `agents/browser/pi`. See
+ * https://github.com/cloudflare/agents/blob/main/docs/agents/browse-the-web.md#persistent-browser
  */
 export function createBrowserTools(
   options: CreateBrowserToolsOptions
-): ServerTool[] {
+): ServerTool<SchemaInput, SchemaInput>[] {
   // This wrapper only surfaces `browser_execute`, so don't build the default-on
   // Quick Action tools just to discard them.
   const { tools } = createBrowserRuntime({ ...options, quickActions: false });
@@ -68,8 +76,9 @@ export function createBrowserTools(
     } as never)) as ProxyToolOutput;
     // TanStack has a single return channel, so what the host sees is what the
     // model sees: apply the AI SDK path's `toModelOutput` projection so a
-    // screenshot's base64 cannot reach the model. The execution envelope
-    // (status, executionId, calls) is preserved either way.
+    // screenshot's base64 cannot reach the model and the durable `calls` log
+    // stays out of its context. The execution envelope (status, executionId)
+    // is preserved either way.
     const modelOutput = await executeTool.toModelOutput?.({
       toolCallId: crypto.randomUUID(),
       input: { code },

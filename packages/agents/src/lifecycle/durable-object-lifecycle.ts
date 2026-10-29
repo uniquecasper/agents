@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { DurableObject } from "cloudflare:workers";
 
 import { publishDiagnosticsEvent } from "../observability/diagnostics";
@@ -21,7 +22,8 @@ import {
   LifecycleCapability,
   type LifecycleHostContextScope,
   type LifecycleRouteAddress,
-  type LifecycleServices
+  type LifecycleServices,
+  type LifecycleStatus
 } from "./capability";
 import {
   runInLifecycleHostContext,
@@ -92,10 +94,10 @@ export type LifecycleRouteTransport = {
   ) => Promise<unknown>;
 };
 
-type LifecycleHost<
-  Env extends object,
-  Props extends Record<string, unknown>
-> = LifecycleObject<Env, Props> & {
+type LifecycleHost<Env extends object, Props extends object> = LifecycleObject<
+  Env,
+  Props
+> & {
   readonly ctx: DurableObjectState;
   readonly constructor: { readonly name: string };
 };
@@ -116,10 +118,19 @@ const lifecycleEventSinks = new WeakMap<object, LifecycleEventSink>();
 const lifecycleRouteTransports = new WeakMap<object, LifecycleRouteTransport>();
 const lifecycleHostInvokers = new WeakMap<object, LifecycleHostInvoker>();
 
+/**
+ * Startup tokens of the Lifecycles whose startup the current async context
+ * is running inside. The scope holds opaque tokens, never a Lifecycle: every
+ * promise reaction created during startup keeps this async context, and
+ * workerd does not trace async context values during GC. A pending promise
+ * stored on a capability would otherwise keep an evicted object alive.
+ */
+const lifecycleStartupScope = new AsyncLocalStorage<ReadonlySet<object>>();
+
 /** @internal Adapt the host invocation boundary at a composition root. */
 export function setLifecycleHostInvoker<
   Env extends object,
-  Props extends Record<string, unknown>
+  Props extends object
 >(lifecycle: Lifecycle<Env, Props>, invoker: LifecycleHostInvoker): void {
   lifecycleHostInvokers.set(lifecycle, invoker);
 }
@@ -127,16 +138,16 @@ export function setLifecycleHostInvoker<
 /** @internal Supply a host's routed Lifecycle transport. */
 export function setLifecycleRouteTransport<
   Env extends object,
-  Props extends Record<string, unknown>
+  Props extends object
 >(lifecycle: Lifecycle<Env, Props>, transport: LifecycleRouteTransport): void {
   lifecycleRouteTransports.set(lifecycle, transport);
 }
 
 /** @internal Adapt Lifecycle's default diagnostics sink at a composition root. */
-export function setLifecycleEventSink<
-  Env extends object,
-  Props extends Record<string, unknown>
->(lifecycle: Lifecycle<Env, Props>, sink: LifecycleEventSink): void {
+export function setLifecycleEventSink<Env extends object, Props extends object>(
+  lifecycle: Lifecycle<Env, Props>,
+  sink: LifecycleEventSink
+): void {
   lifecycleEventSinks.set(lifecycle, sink);
 }
 
@@ -150,29 +161,19 @@ export type LifecycleOptions = {
   readonly maxAlarmMemoryLimitStrikes?: number;
 };
 
-/** Placement of a capability in the dispatch order. */
-export type LifecycleUseOptions = {
-  /**
-   * Dispatch after every non-fallback capability, whenever it was
-   * installed. For a host's catch-all, such as a WebSockets capability
-   * that claims every upgrade, so middleware installed later still runs
-   * first.
-   */
-  readonly fallback?: boolean;
-};
-
 /**
  * Installs and coordinates the runtime lifecycle for a Durable Object.
  *
  * Construct this as an instance field on a class that directly extends
  * `DurableObject`, then call {@link Lifecycle.installHandlers}
  * from that class's constructor.
- *
- * @experimental The API surface may change before stabilizing.
  */
+/** The dispatch hooks a catch-all can monopolize; uniqueness is per hook. */
+const CATCH_ALL_HOOKS = ["onRequest", "onWebSocketUpgrade"] as const;
+
 export class Lifecycle<
   Env extends object = Cloudflare.Env,
-  Props extends Record<string, unknown> = Record<string, unknown>
+  Props extends object = object
 > {
   readonly #host: LifecycleHost<Env, Props>;
   readonly #ctx: DurableObjectState;
@@ -184,13 +185,12 @@ export class Lifecycle<
   readonly #jobQueue: JobQueue;
   readonly #jobDriver: JobDriver;
 
-  #status: "zero" | "starting" | "started" = "zero";
+  #status: LifecycleStatus = "zero";
   #alarmRearmQueue: Promise<void> = Promise.resolve();
   #rearmRequestedDuringStart = false;
   #pendingEvents: LifecycleEvent[] = [];
   #alarmsDisabled = false;
   #capabilitiesLocked = false;
-  readonly #fallbacks = new Set<DurableObjectCapability<Props>>();
   #handlersInstalled = false;
 
   /**
@@ -199,10 +199,7 @@ export class Lifecycle<
    * @param host - The Durable Object whose runtime handlers the lifecycle owns.
    * @returns The installed lifecycle.
    */
-  static install<
-    Env extends object,
-    Props extends Record<string, unknown> = Record<string, unknown>
-  >(
+  static install<Env extends object, Props extends object = object>(
     host: DurableObject<Env>,
     options?: LifecycleOptions
   ): Lifecycle<Env, Props> {
@@ -285,17 +282,17 @@ export class Lifecycle<
   /**
    * Add a reusable capability before this lifecycle starts.
    *
-   * Capabilities dispatch in registration order, except that fallbacks
-   * always come after non-fallbacks.
+   * Capabilities dispatch in registration order, except that a capability
+   * declaring `claims: "catch-all"` always comes last, whenever it was
+   * installed. Catch-alls are unique per dispatch hook: two may coexist
+   * when they claim disjoint traffic (one `onRequest`, one
+   * `onWebSocketUpgrade`), but a second catch-all for the same hook could
+   * never be reached and is refused.
    *
    * @param capability - The capability to add.
-   * @param options - Dispatch placement.
    * @returns This lifecycle.
    */
-  use(
-    capability: DurableObjectCapability<Props>,
-    options?: LifecycleUseOptions
-  ): this {
+  use(capability: DurableObjectCapability<Props>): this {
     if (this.#capabilitiesLocked) {
       throw new Error("Lifecycle capabilities must be added before startup");
     }
@@ -311,17 +308,31 @@ export class Lifecycle<
       );
     }
 
-    const firstFallback = this.#capabilities.findIndex((candidate) =>
-      this.#fallbacks.has(candidate)
+    const catchAllIndex = this.#capabilities.findIndex(
+      (candidate) => candidate.claims === "catch-all"
     );
-    if (options?.fallback) this.#fallbacks.add(capability);
-    this.#capabilities.splice(
-      options?.fallback || firstFallback === -1
-        ? this.#capabilities.length
-        : firstFallback,
-      0,
-      capability
-    );
+    if (capability.claims === "catch-all") {
+      for (const hook of CATCH_ALL_HOOKS) {
+        if (!capability[hook]) continue;
+        const rival = this.#capabilities.find(
+          (candidate) => candidate.claims === "catch-all" && candidate[hook]
+        );
+        if (!rival) continue;
+        const installed = lifecycleCapabilityId(rival);
+        throw new Error(
+          `Lifecycle already has a catch-all for ${hook}${
+            installed ? ` (${JSON.stringify(installed)})` : ""
+          }; a second one could never be reached`
+        );
+      }
+      this.#capabilities.push(capability);
+    } else {
+      this.#capabilities.splice(
+        catchAllIndex === -1 ? this.#capabilities.length : catchAllIndex,
+        0,
+        capability
+      );
+    }
 
     if (capability instanceof LifecycleCapability) {
       bindLifecycleCapability(
@@ -340,6 +351,10 @@ export class Lifecycle<
       payload
     });
     return Object.freeze({
+      get name() {
+        return lifecycle.name;
+      },
+      className: this.#parentClassName,
       storage: this.#ctx.storage,
       sockets: Object.freeze({
         accept: (ws: WebSocket, tags: string[]) =>
@@ -347,7 +362,7 @@ export class Lifecycle<
         get: (tag?: string) => this.#ctx.getWebSockets(tag)
       }),
       ready: () => this.#readyForCapabilityOperation(),
-      starting: () => this.#status === "starting",
+      status: () => this.#status,
       jobs: this.#jobsForOwner(capabilityId),
       trackAlarmWork: (work: Promise<unknown>) =>
         this.#jobDriver.trackAlarmWork(work),
@@ -406,9 +421,8 @@ export class Lifecycle<
     );
   }
 
-  async #readyForCapabilityOperation(): Promise<void> {
-    if (this.#status === "starting" || this.#status === "started") return;
-    await this.start();
+  #readyForCapabilityOperation(): Promise<void> {
+    return this.#ensureInitialized();
   }
 
   async #dispatchRoute(envelope: LifecycleRouteEnvelope): Promise<unknown> {
@@ -641,16 +655,53 @@ export class Lifecycle<
    * Runtime fetch, alarm, and WebSocket entry points call this automatically.
    * RPC methods may call it explicitly because native RPC bypasses fetch.
    *
+   * Concurrent callers share one startup and all observe its outcome. A call
+   * made from inside that startup, such as a capability or `onStart` calling
+   * back into the host, returns immediately instead of waiting on itself.
+   *
    * @param props - Optional properties supplied to capability and host startup.
+   *   Ignored while a startup is already in flight.
    */
   async start(props?: Props): Promise<void> {
-    if (props !== undefined) this.#props = props;
+    if (props !== undefined && this.#startup === undefined) {
+      this.#props = props;
+    }
     await this.#ensureInitialized();
   }
 
-  async #ensureInitialized(): Promise<void> {
-    if (this.#status === "started") return;
+  /**
+   * Whether lifecycle startup has completed for this instance.
+   *
+   * @returns `true` after capabilities and the host `onStart` have finished.
+   */
+  isStarted(): boolean {
+    return this.#status === "started";
+  }
 
+  #startup: Promise<void> | undefined;
+  /** Marks this Lifecycle in {@link lifecycleStartupScope}. */
+  readonly #startupToken = {};
+
+  #ensureInitialized(): Promise<void> {
+    if (this.#status === "started") return Promise.resolve();
+    if (this.#startup === undefined) {
+      // Deferred a tick so `#startup` is assigned before startup can call
+      // back into this method synchronously.
+      const startup = Promise.resolve()
+        .then(() => this.#runStartup())
+        .finally(() => {
+          if (this.#startup === startup) this.#startup = undefined;
+        });
+      this.#startup = startup;
+      return startup;
+    }
+    if (lifecycleStartupScope.getStore()?.has(this.#startupToken)) {
+      return Promise.resolve();
+    }
+    return this.#startup;
+  }
+
+  async #runStartup(): Promise<void> {
     if (this.#ctx.id.name === undefined && this.#legacyName === undefined) {
       this.#legacyName = await this.#ctx.storage.get<string>(
         LEGACY_NAME_STORAGE_KEY
@@ -660,27 +711,40 @@ export class Lifecycle<
     void this.name;
 
     this.#capabilitiesLocked = true;
+    const scope = new Set(lifecycleStartupScope.getStore());
+    scope.add(this.#startupToken);
     let error: unknown;
-    await this.#ctx.blockConcurrencyWhile(async () => {
-      this.#status = "starting";
-      try {
-        await runWithoutCurrentAgent(() =>
-          this.#capabilityRunner.start({ props: this.#props })
-        );
-        await runInLifecycleHostContext({ host: this.#host }, () =>
-          this.#host.onStart?.(this.#props)
-        );
-        this.#status = "started";
-      } catch (cause) {
-        this.#status = "zero";
-        error = cause;
-      }
-    });
+    await this.#ctx.blockConcurrencyWhile(() =>
+      lifecycleStartupScope.run(scope, async () => {
+        this.#status = "starting";
+        try {
+          await runWithoutCurrentAgent(() =>
+            this.#capabilityRunner.start({ props: this.#props })
+          );
+          await runInLifecycleHostContext({ host: this.#host }, () =>
+            this.#host.onStart?.(this.#props)
+          );
+          this.#status = "started";
+        } catch (cause) {
+          this.#status = "zero";
+          error = cause;
+        }
+      })
+    );
     // Re-throw outside blockConcurrencyWhile so the input gate is not
     // permanently broken and a later invocation can retry startup.
     if (error) {
+      const rearmRequested = this.#rearmRequestedDuringStart;
       this.#rearmRequestedDuringStart = false;
       this.#pendingEvents.length = 0;
+      if (rearmRequested) {
+        // Jobs pushed or re-timed during the failed startup deferred their
+        // re-arm to here. Arm the startup fallback from the current queue so
+        // they keep a wake. Best-effort: the startup error is what surfaces.
+        await this.#serializeAlarmWrite(() =>
+          this.#jobDriver.armStartupFallback()
+        ).catch(() => {});
+      }
       throw error;
     }
     this.#deliverPendingEvents();
@@ -756,20 +820,25 @@ export class Lifecycle<
       return;
     }
 
-    const prior = this.#alarmRearmQueue;
-    const next = prior
-      .catch(() => {})
-      .then(async () => {
-        if (this.#alarmsDisabled) return;
-        const alarm = this.#jobQueue.nextAlarmTime(Date.now());
-        if (alarm === null) {
-          await this.#ctx.storage.deleteAlarm();
-        } else {
-          await this.#ctx.storage.setAlarm(alarm);
-        }
-      });
+    await this.#serializeAlarmWrite(async () => {
+      if (this.#alarmsDisabled) return;
+      const alarm = this.#jobQueue.nextAlarmTime(Date.now());
+      if (alarm === null) {
+        await this.#ctx.storage.deleteAlarm();
+      } else {
+        await this.#ctx.storage.setAlarm(alarm);
+      }
+    });
+  }
+
+  /**
+   * Run an alarm write after every earlier one settles, so a later
+   * calculation from fresher queue state always lands last.
+   */
+  #serializeAlarmWrite(write: () => Promise<void>): Promise<void> {
+    const next = this.#alarmRearmQueue.catch(() => {}).then(write);
     this.#alarmRearmQueue = next;
-    await next;
+    return next;
   }
 
   /**

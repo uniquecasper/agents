@@ -1,5 +1,321 @@
 # @cloudflare/think
 
+## 0.23.0
+
+### Minor Changes
+
+- [#2771](https://github.com/cloudflare/agents/pull/2771) [`54ae3e8`](https://github.com/cloudflare/agents/commit/54ae3e86987be92ae20bc6a8b06c26ec1884d01c) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Breaking: Think reloads `getSkills()` sources every turn, so `skills.workspace(this.workspace)` picks up skills written to `/workspace/.agents/skills`; an overridden `getSystemPrompt()` now always renders above context blocks instead of being dropped once any block exists; skill catalog changes reach the model as a context reminder rather than rebuilding the cached system prompt; `skillWorkspace` and the extension `"skill"` context block type are removed. See [Agent Skills](https://developers.cloudflare.com/agents/skills/).
+
+## 0.22.0
+
+### Minor Changes
+
+- [#2632](https://github.com/cloudflare/agents/pull/2632) [`361046e`](https://github.com/cloudflare/agents/commit/361046e4f5f528540783d9078c438cb3cbe2d470) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Remove `lazyWorkspace`, exported by mistake in 0.21.0. Use `getWorkspace(() => stub)` from `@cloudflare/computer` instead. Think's `@cloudflare/computer` peer is now `^0.8.0`, so upgrade Computer to 0.8 alongside Think. See [Multi-session chat](https://github.com/cloudflare/agents/blob/main/docs/think/multi-chat.md#share-the-workspace).
+
+### Patch Changes
+
+- [#2678](https://github.com/cloudflare/agents/pull/2678) [`325c6ca`](https://github.com/cloudflare/agents/commit/325c6ca1c9c28f056aa14df6c611c165062151f5) Thanks [@github-actions](https://github.com/apps/github-actions)! - Fix the `ai` peer dependency version in the Think README; see [Think dependencies](https://github.com/cloudflare/agents/blob/main/docs/think/index.md#dependencies).
+
+## 0.21.0
+
+### Minor Changes
+
+- [#2561](https://github.com/cloudflare/agents/pull/2561) [`998ae40`](https://github.com/cloudflare/agents/commit/998ae40e999b5d5acc5bd0f64f538732457fc613) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Think's workspace tools are now `@cloudflare/computer`'s `createAITools`, and `exec` offers every backend the Workspace has; `createWorkspaceTools`, `workspaceBash`, and `@cloudflare/think/tools/workspace` are removed. See [Built-in workspace tools](https://github.com/cloudflare/agents/blob/main/docs/think/tools.md#built-in-workspace-tools).
+
+- [#2560](https://github.com/cloudflare/agents/pull/2560) [`8c720d3`](https://github.com/cloudflare/agents/commit/8c720d3b0d7703741bf0f6e47b571d3e21c50742) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Think's `workspace` is now a `Workspace` from `@cloudflare/computer`, a new peer dependency. See [Upgrading to a Computer workspace](https://github.com/cloudflare/agents/blob/main/docs/think/index.md#upgrading-to-a-computer-workspace).
+
+- [#2562](https://github.com/cloudflare/agents/pull/2562) [`db4303c`](https://github.com/cloudflare/agents/commit/db4303c924c8fe33f25afbc42c70f72d82f6dc28) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Think no longer depends on `@cloudflare/shell`, and the execute tool's `state` option is removed. See [Code Execution Tool](https://github.com/cloudflare/agents/blob/main/docs/think/tools.md#code-execution-tool).
+
+- [#2565](https://github.com/cloudflare/agents/pull/2565) [`f56cd20`](https://github.com/cloudflare/agents/commit/f56cd20dd58dc88f4b76a601bcd94b9eabcd6661) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `createExecuteTool` and `createExecuteRuntime` are deprecated in favour of `exec` with a `ws:tools` module. See [Calling the agent's tools from code](https://github.com/cloudflare/agents/blob/main/docs/think/tools.md#calling-the-agents-tools-from-code).
+
+### Patch Changes
+
+- [#2615](https://github.com/cloudflare/agents/pull/2615) [`05843e4`](https://github.com/cloudflare/agents/commit/05843e428be0d8b43a5bf1923d8e40adce6f213d) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Chat recovery now seals a turn after `chatRecovery.maxInterruptedAttempts` interrupted attempts (default 5), so a turn that exceeds the Durable Object memory limit on every run no longer retries forever; `maxOomRetries` is deprecated. See [Stream Recovery](https://github.com/cloudflare/agents/blob/main/docs/agents/chat-agents.md#stream-recovery).
+
+- [#2593](https://github.com/cloudflare/agents/pull/2593) [`b905483`](https://github.com/cloudflare/agents/commit/b905483d9cfd37e20f323d24bbc0344b289b4ea6) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Reuse one `Intl.DateTimeFormat` per timezone when computing wall-clock scheduled task occurrences, cutting the CPU cost of each occurrence substantially. See [#2583](https://github.com/cloudflare/agents/issues/2583); thanks @Bowiemb.
+
+## 0.20.2
+
+### Patch Changes
+
+- [#2522](https://github.com/cloudflare/agents/pull/2522) [`bcf5d20`](https://github.com/cloudflare/agents/commit/bcf5d2057aa477da9f464af8496a21811416a7c4) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `fetch_url` now blocks private and local hosts using the shared policy from `agents/webfetch`. See [Fetch the Web: URL policy](https://github.com/cloudflare/agents/blob/main/docs/agents/fetch-the-web.md#url-policy).
+
+## 0.20.1
+
+### Patch Changes
+
+- [#2495](https://github.com/cloudflare/agents/pull/2495) [`88d6745`](https://github.com/cloudflare/agents/commit/88d6745c53cf69a343fcbe8f3bd17ea58590d27e) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Fix a chat that could stall when the model chains fast client tool calls across steps.
+
+## 0.20.0
+
+### Minor Changes
+
+- [#2388](https://github.com/cloudflare/agents/pull/2388) [`1031c0f`](https://github.com/cloudflare/agents/commit/1031c0f5c85f80ce0879dd8b07f151f3293c9120) Thanks [@threepointone](https://github.com/threepointone)! - Require `ai@^7` and `@ai-sdk/react@^4`, because Think bundles providers that return AI SDK v7 models. See [Think dependencies](https://github.com/cloudflare/agents/blob/main/docs/think/index.md#dependencies).
+
+- [#2056](https://github.com/cloudflare/agents/pull/2056) [`20142e5`](https://github.com/cloudflare/agents/commit/20142e52901ddbbb0d940ecef0e82ec9e7d01cab) Thanks [@AntoniTok](https://github.com/AntoniTok)! - Breaking: declared scheduled tasks now run on the root agent only; override `getScheduledTasksScope()` to return `"all"` for per-facet scheduling. See [Think scheduled tasks](https://github.com/cloudflare/agents/blob/main/docs/think/index.md#scheduled-tasks).
+
+- [#2330](https://github.com/cloudflare/agents/pull/2330) [`e80278e`](https://github.com/cloudflare/agents/commit/e80278e2f484c55124884e5a2fc5bd215eaf77fa) Thanks [@threepointone](https://github.com/threepointone)! - Browser chat turns now use the `web` channel, so its configured tools and turn limit apply. See [Think channels](https://github.com/cloudflare/agents/blob/main/docs/think/channels.md).
+
+### Patch Changes
+
+- [#2390](https://github.com/cloudflare/agents/pull/2390) [`c55ec80`](https://github.com/cloudflare/agents/commit/c55ec80087ba2531ccdc9e211921fb5bf6ddb065) Thanks [@threepointone](https://github.com/threepointone)! - Report a failed agent-tool child as failed even when it was evicted before recording the failure. See [Agent tools](https://github.com/cloudflare/agents/blob/main/docs/agents/agent-tools.md).
+
+- [#2384](https://github.com/cloudflare/agents/pull/2384) [`f904999`](https://github.com/cloudflare/agents/commit/f9049991fe9ca637b5326788e08e1cea6b4280c1) Thanks [@threepointone](https://github.com/threepointone)! - Fix agent-tool chunks being duplicated or dropped on reconnect, child re-attach, and fiber recovery. See [Agent tools](https://github.com/cloudflare/agents/blob/main/docs/agents/agent-tools.md).
+
+- [#2364](https://github.com/cloudflare/agents/pull/2364) [`5e0507e`](https://github.com/cloudflare/agents/commit/5e0507e5f1ba27cc7c2bf2920c380a7c8f9caaad) Thanks [@threepointone](https://github.com/threepointone)! - Add `eventDelivery: "terminal"` to `runAgentTool` to forward only lifecycle, progress, and milestone events for a run. See [Agent tools](https://github.com/cloudflare/agents/blob/main/docs/agents/agent-tools.md).
+
+- [#2334](https://github.com/cloudflare/agents/pull/2334) [`7f564e7`](https://github.com/cloudflare/agents/commit/7f564e7bfeee6ec976c12ce1e4dbbaa150906d26) Thanks [@threepointone](https://github.com/threepointone)! - AI Chat and Think send the terminal `done` frame after persisting and broadcasting the assistant reply, so later sends are not overwritten. See [Chat agents](https://github.com/cloudflare/agents/blob/main/docs/agents/chat-agents.md).
+
+- [#2391](https://github.com/cloudflare/agents/pull/2391) [`d3fe93c`](https://github.com/cloudflare/agents/commit/d3fe93cd968ea4d8e57a909dcbfd56b879df77e0) Thanks [@threepointone](https://github.com/threepointone)! - Keep a tool call's input when its approval request arrives before the input finishes streaming ([#1872](https://github.com/cloudflare/agents/issues/1872)). See [Human in the loop](https://github.com/cloudflare/agents/blob/main/docs/agents/human-in-the-loop.md).
+
+- [#2326](https://github.com/cloudflare/agents/pull/2326) [`a3e4eef`](https://github.com/cloudflare/agents/commit/a3e4eef6a77d821819d5438105287700ea1c6426) Thanks [@threepointone](https://github.com/threepointone)! - Fix two Think warnings that fired, or failed to fire, because of a false method-override check. See [Think lifecycle hooks](https://github.com/cloudflare/agents/blob/main/docs/think/lifecycle-hooks.md).
+
+- [#2408](https://github.com/cloudflare/agents/pull/2408) [`6c8f85a`](https://github.com/cloudflare/agents/commit/6c8f85a571802881e5e380ecce03eb24d6fb5f71) Thanks [@threepointone](https://github.com/threepointone)! - Require `agents@>=0.25.0` so Think and AI Chat can import the chat helpers provided by that release.
+
+- [#2378](https://github.com/cloudflare/agents/pull/2378) [`dbf170c`](https://github.com/cloudflare/agents/commit/dbf170cf7d0313ffe79d7d6a84201841f2e12184) Thanks [@threepointone](https://github.com/threepointone)! - `useAgentChat` gains `onTurnEnd`, and terminal chat frames carry outcomes and user message IDs so clients can settle sends correctly across recovery and reconnects. Replay, tool callbacks, and turn state now remain consistent through terminal delivery; see [Chat agents](https://github.com/cloudflare/agents/blob/main/docs/agents/chat-agents.md).
+
+- [#2005](https://github.com/cloudflare/agents/pull/2005) [`c2f7672`](https://github.com/cloudflare/agents/commit/c2f767235e749cb3f6334ed22e70a03940dcd18c) Thanks [@cjol](https://github.com/cjol)! - Native RPC calls to async Agent and Think methods now start lifecycle initialization first; address Agents by name because raw IDs from `newUniqueId()` and `idFromString()` now fail their first async RPC. See [Lifecycle](https://github.com/cloudflare/agents/blob/main/docs/agents/lifecycle.md).
+
+- [#2036](https://github.com/cloudflare/agents/pull/2036) [`040db5c`](https://github.com/cloudflare/agents/commit/040db5c9342d74c84340858f04fd5410f84ff4f8) Thanks [@justanotherbyte](https://github.com/justanotherbyte)! - Stop storing compaction summaries that clients echo back, and hide duplicates already stored ([#1984](https://github.com/cloudflare/agents/issues/1984)). See [Sessions](https://github.com/cloudflare/agents/blob/main/docs/agents/sessions.md).
+
+- [#2405](https://github.com/cloudflare/agents/pull/2405) [`11f87b5`](https://github.com/cloudflare/agents/commit/11f87b5332f6cf4dfff71d8249621b28f539280f) Thanks [@threepointone](https://github.com/threepointone)! - Context blocks can set `whenChanged: "remind"` to send changes as a reminder after the cached prompt instead of rewriting it. See [Context](https://github.com/cloudflare/agents/blob/main/docs/agents/context.md).
+
+- [#2393](https://github.com/cloudflare/agents/pull/2393) [`a7d0e02`](https://github.com/cloudflare/agents/commit/a7d0e02a2b5cfb651b34f8f7970eed4f172658c6) Thanks [@threepointone](https://github.com/threepointone)! - Continuation turns that fail before streaming now report an error to clients and `onChatResponse` instead of appearing to hang ([#2381](https://github.com/cloudflare/agents/issues/2381)). See [Client tools](https://github.com/cloudflare/agents/blob/main/docs/agents/client-tools-continuation.md).
+
+- [#2323](https://github.com/cloudflare/agents/pull/2323) [`57e2e46`](https://github.com/cloudflare/agents/commit/57e2e46ee14eb5df72a8569074f43e4f4f336d0e) Thanks [@threepointone](https://github.com/threepointone)! - Messenger attachments load when `fetchData` returns a plain `ArrayBuffer`. See [Messengers](https://github.com/cloudflare/agents/blob/main/docs/think/messengers.md).
+
+- [#2325](https://github.com/cloudflare/agents/pull/2325) [`6289a15`](https://github.com/cloudflare/agents/commit/6289a15794ca308f971ed978cd5adc4d27e6a546) Thanks [@threepointone](https://github.com/threepointone)! - Messenger replies now see every message in a quick burst, not just the last one. See [Messengers](https://github.com/cloudflare/agents/blob/main/docs/think/messengers.md).
+
+- [#2324](https://github.com/cloudflare/agents/pull/2324) [`34df44b`](https://github.com/cloudflare/agents/commit/34df44b9f0b5b6c47674a746cc4071df824baceb) Thanks [@threepointone](https://github.com/threepointone)! - Messenger replies no longer post a `...` placeholder on adapters without native streaming. See [Messengers](https://github.com/cloudflare/agents/blob/main/docs/think/messengers.md).
+
+- [#2347](https://github.com/cloudflare/agents/pull/2347) [`00a07bd`](https://github.com/cloudflare/agents/commit/00a07bdc5b68c4537c15c551c47f62b3283764d4) Thanks [@threepointone](https://github.com/threepointone)! - A recovered messenger turn delivers its answer to the thread instead of an "interrupted" apology. See [Messengers](https://github.com/cloudflare/agents/blob/main/docs/think/messengers.md).
+
+- [#2353](https://github.com/cloudflare/agents/pull/2353) [`06d50eb`](https://github.com/cloudflare/agents/commit/06d50ebf65460e52b4ca292c9cd6d7f44fb6c706) Thanks [@threepointone](https://github.com/threepointone)! - `rejectExecution()` accepts `{ autoContinue: false }` to record a rejection without starting another turn. See [Actions](https://github.com/cloudflare/agents/blob/main/docs/think/actions.md).
+
+- [#2238](https://github.com/cloudflare/agents/pull/2238) [`c3a4010`](https://github.com/cloudflare/agents/commit/c3a401006b482fab061030ac13536e1e0025fd59) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Interfaces can now be used as `Props` on `Agent`, `AIChatAgent`, `Think`, and routing helpers. See [Routing](https://github.com/cloudflare/agents/blob/main/docs/agents/routing.md).
+
+- [#2040](https://github.com/cloudflare/agents/pull/2040) [`2afe0e0`](https://github.com/cloudflare/agents/commit/2afe0e0ba9eb91605adb0bcac289e9df8a723aa7) Thanks [@AntoniTok](https://github.com/AntoniTok)! - Keep assistant messages and tool outputs attached to the correct turn when a provider reuses a `toolCallId`; `resolveToolMergeId` is deprecated in favour of `reconcileMessages`. See [Chat agents](https://github.com/cloudflare/agents/blob/main/docs/agents/chat-agents.md).
+
+- [#2039](https://github.com/cloudflare/agents/pull/2039) [`c658b83`](https://github.com/cloudflare/agents/commit/c658b832d5aa32c45b64b7748aac1c02ea370003) Thanks [@justanotherbyte](https://github.com/justanotherbyte)! - `useAgentChat` keeps messages sent while disconnected when reconnecting, including Think transcripts, instead of erasing them ([#1983](https://github.com/cloudflare/agents/issues/1983)). See [Chat agents](https://github.com/cloudflare/agents/blob/main/docs/agents/chat-agents.md).
+
+- [#2348](https://github.com/cloudflare/agents/pull/2348) [`39361fa`](https://github.com/cloudflare/agents/commit/39361fa8c2194bb46c2b165454726252cca80c34) Thanks [@threepointone](https://github.com/threepointone)! - Fix text appearing twice when reconnecting during a tool continuation. See [Resumable streaming](https://github.com/cloudflare/agents/blob/main/docs/agents/resumable-streaming.md).
+
+- [#2340](https://github.com/cloudflare/agents/pull/2340) [`3b278b2`](https://github.com/cloudflare/agents/commit/3b278b2c987f47247e551731a1fea9b6dd154456) Thanks [@threepointone](https://github.com/threepointone)! - `onChatResponse` still fires, with `recovered: true`, for a turn persisted just before a Durable Object reset ([#2266](https://github.com/cloudflare/agents/issues/2266), [#1842](https://github.com/cloudflare/agents/issues/1842)). See [Think lifecycle hooks](https://github.com/cloudflare/agents/blob/main/docs/think/lifecycle-hooks.md).
+
+- [#2404](https://github.com/cloudflare/agents/pull/2404) [`9d125c8`](https://github.com/cloudflare/agents/commit/9d125c8d75571ccde8abb8c0c75ff343a7ef149a) Thanks [@threepointone](https://github.com/threepointone)! - Add `session.mirror()` to keep an in-memory transcript in sync with a session's change feed. See [Sessions](https://github.com/cloudflare/agents/blob/main/docs/agents/sessions.md).
+
+- [#2392](https://github.com/cloudflare/agents/pull/2392) [`4f26402`](https://github.com/cloudflare/agents/commit/4f2640204adb629fe6bf0143ed43e65fc6a46703) Thanks [@threepointone](https://github.com/threepointone)! - Settle approved tool calls that never ran once the conversation moves past them, so later turns don't send unresolved tool calls ([#2382](https://github.com/cloudflare/agents/issues/2382)). See [Human in the loop](https://github.com/cloudflare/agents/blob/main/docs/agents/human-in-the-loop.md).
+
+- [#2321](https://github.com/cloudflare/agents/pull/2321) [`7d58ade`](https://github.com/cloudflare/agents/commit/7d58ade09cfaa67cde194e75ff76b40fed8faf6d) Thanks [@threepointone](https://github.com/threepointone)! - Think can write server-authored `messageMetadata` onto assistant messages, per agent or per turn, and recovery preserves metadata even when keys match built-in object properties. See [Think lifecycle hooks](https://github.com/cloudflare/agents/blob/main/docs/think/lifecycle-hooks.md).
+
+- [#2329](https://github.com/cloudflare/agents/pull/2329) [`558424c`](https://github.com/cloudflare/agents/commit/558424ce7c9ca8f4368602684a55718443b12cef) Thanks [@threepointone](https://github.com/threepointone)! - Recovery continuations extend the interrupted assistant message instead of adding a second one. See [Think](https://github.com/cloudflare/agents/blob/main/docs/think/index.md).
+
+- [#2331](https://github.com/cloudflare/agents/pull/2331) [`0c5fd95`](https://github.com/cloudflare/agents/commit/0c5fd959aa817845ef4e8cfde5a23de407392afe) Thanks [@threepointone](https://github.com/threepointone)! - Resolving a paused execution removes the model's now-stale "waiting for approval" text from the transcript ([#2054](https://github.com/cloudflare/agents/issues/2054)). See [Actions](https://github.com/cloudflare/agents/blob/main/docs/think/actions.md).
+
+- [#2355](https://github.com/cloudflare/agents/pull/2355) [`ccca389`](https://github.com/cloudflare/agents/commit/ccca38957405167bebb0d524271d5af7d55b464b) Thanks [@threepointone](https://github.com/threepointone)! - Add `getGateway(model)` to set AI Gateway options such as metadata and caching for string models ([#2262](https://github.com/cloudflare/agents/issues/2262)). See [Think](https://github.com/cloudflare/agents/blob/main/docs/think/index.md).
+
+- [#2388](https://github.com/cloudflare/agents/pull/2388) [`1031c0f`](https://github.com/cloudflare/agents/commit/1031c0f5c85f80ce0879dd8b07f151f3293c9120) Thanks [@threepointone](https://github.com/threepointone)! - `resolveModel()` rejects malformed model ids up front, and `@hf/...` ids get the same Workers AI settings as `@cf/...`. See [Think](https://github.com/cloudflare/agents/blob/main/docs/think/index.md).
+
+- [#2354](https://github.com/cloudflare/agents/pull/2354) [`d3cb4e1`](https://github.com/cloudflare/agents/commit/d3cb4e136d3d68ee66c5f5bef28ca105d3a49eff) Thanks [@threepointone](https://github.com/threepointone)! - Add `messengerConcurrency` to choose the Chat SDK concurrency strategy for messenger replies ([#2313](https://github.com/cloudflare/agents/issues/2313)). See [Messengers](https://github.com/cloudflare/agents/blob/main/docs/think/messengers.md).
+
+- [#2387](https://github.com/cloudflare/agents/pull/2387) [`9f70bc8`](https://github.com/cloudflare/agents/commit/9f70bc82db11b2a5ee9f5f8f3134991b21d21c55) Thanks [@threepointone](https://github.com/threepointone)! - Messenger replies hold the thread lock and retain queued follow-ups during slow delivery; typing updates are serialized and settle before reply text arrives. See [Think messengers](https://github.com/cloudflare/agents/blob/main/docs/think/messengers.md).
+
+- [#2413](https://github.com/cloudflare/agents/pull/2413) [`bcb1f12`](https://github.com/cloudflare/agents/commit/bcb1f12f48a9511dcc368da8cf63fe1dba3330eb) Thanks [@threepointone](https://github.com/threepointone)! - Fix regenerate continuing the old response instead of replacing it ([#2028](https://github.com/cloudflare/agents/issues/2028)). See [Multi-chat](https://github.com/cloudflare/agents/blob/main/docs/think/multi-chat.md).
+
+- [#2417](https://github.com/cloudflare/agents/pull/2417) [`9906881`](https://github.com/cloudflare/agents/commit/99068812e5e91f039a15d0848e8e0bdf27177158) Thanks [@threepointone](https://github.com/threepointone)! - A regeneration interrupted by a restart now recovers on its own branch. See [Multi-chat](https://github.com/cloudflare/agents/blob/main/docs/think/multi-chat.md).
+
+- [#2356](https://github.com/cloudflare/agents/pull/2356) [`f92420f`](https://github.com/cloudflare/agents/commit/f92420fea9f6f17d3a1f86dba6c8c0c054769a1f) Thanks [@threepointone](https://github.com/threepointone)! - Older-message truncation moves in steps (`truncationStep`), so the prompt-cache prefix stays stable across turns ([#2200](https://github.com/cloudflare/agents/issues/2200)). See [Think](https://github.com/cloudflare/agents/blob/main/docs/think/index.md).
+
+- [#2328](https://github.com/cloudflare/agents/pull/2328) [`84e6e5c`](https://github.com/cloudflare/agents/commit/84e6e5cb40f8b5c589198dc7a63867fc4559c4b5) Thanks [@threepointone](https://github.com/threepointone)! - Stream-stall recovery retries stalls before the first chunk and now calls `onChatRecovery`. See [Think lifecycle hooks](https://github.com/cloudflare/agents/blob/main/docs/think/lifecycle-hooks.md).
+
+- [#2362](https://github.com/cloudflare/agents/pull/2362) [`7a30c1f`](https://github.com/cloudflare/agents/commit/7a30c1f3adecf4ea1a66737dc4f5dc943e89f3e1) Thanks [@threepointone](https://github.com/threepointone)! - `step.prompt()` turns interrupted mid-stream now recover with their structured output instead of failing ([#1727](https://github.com/cloudflare/agents/issues/1727)). See [Workflows](https://github.com/cloudflare/agents/blob/main/docs/think/workflows.md).
+
+- [#2351](https://github.com/cloudflare/agents/pull/2351) [`0b13fe0`](https://github.com/cloudflare/agents/commit/0b13fe0d8f8834857eaaf9526e20b4d0f658568f) Thanks [@threepointone](https://github.com/threepointone)! - Add `waitForSubmission()` for durable submissions and harden cancellation, status-hook, reset-turn, and paused-tool lifecycle handling so waits settle and terminal status is reported once. See [Programmatic submissions](https://github.com/cloudflare/agents/blob/main/docs/think/programmatic-submissions.md).
+
+- [#2414](https://github.com/cloudflare/agents/pull/2414) [`484f7ab`](https://github.com/cloudflare/agents/commit/484f7abbe7cca5261435eafb97bf4ea99cb35fb1) Thanks [@threepointone](https://github.com/threepointone)! - `telegramMessenger` adds a `nativeStreaming` option and works with `verifyWebhook` on `@chat-adapter/telegram` 4.38 ([#2397](https://github.com/cloudflare/agents/issues/2397)). See [Messengers](https://github.com/cloudflare/agents/blob/main/docs/think/messengers.md).
+
+- [#2350](https://github.com/cloudflare/agents/pull/2350) [`52e624e`](https://github.com/cloudflare/agents/commit/52e624e56289fccba4523b729c0abbb62c80926b) Thanks [@threepointone](https://github.com/threepointone)! - Think hooks and tools can read the running turn identity, and `activeChannel` stays scoped to its owning turn. See [Lifecycle hooks](https://github.com/cloudflare/agents/blob/main/docs/think/lifecycle-hooks.md).
+
+- [#2343](https://github.com/cloudflare/agents/pull/2343) [`a2f6f94`](https://github.com/cloudflare/agents/commit/a2f6f944bfc4a9e1c878e2f74822c9ef98c35857) Thanks [@threepointone](https://github.com/threepointone)! - Harden transient chat recovery across Think and AI Chat, including retry budgeting, cancellation, terminal error delivery, and recovery after restarts. See the [`agents/chat` recovery helpers](https://github.com/cloudflare/agents/blob/main/docs/think/lifecycle-hooks.md).
+
+- [#2339](https://github.com/cloudflare/agents/pull/2339) [`1edc989`](https://github.com/cloudflare/agents/commit/1edc989c82c58879c37ed8e81f5d6813fb4599eb) Thanks [@threepointone](https://github.com/threepointone)! - Truncate older tool results after model conversion so `toModelOutput` and provider-executed tools keep valid outputs ([#2014](https://github.com/cloudflare/agents/issues/2014)). See [Sessions](https://github.com/cloudflare/agents/blob/main/docs/agents/sessions.md).
+
+- [#2290](https://github.com/cloudflare/agents/pull/2290) [`5848d71`](https://github.com/cloudflare/agents/commit/5848d71b21a96c9484811a7f65dc2591853ffe7e) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `runTurn({ mode: "wait" })` returns the assistant message from its own turn, even if other turns persist in the meantime. See [Programmatic submissions](https://github.com/cloudflare/agents/blob/main/docs/think/programmatic-submissions.md).
+
+- [#2341](https://github.com/cloudflare/agents/pull/2341) [`caef62a`](https://github.com/cloudflare/agents/commit/caef62a30a169d9392986f548e6b7f3551548663) Thanks [@threepointone](https://github.com/threepointone)! - Wait-mode `TurnResult.output` returns the parsed structured output, and submission inspections include the persisted `messageId` ([#2263](https://github.com/cloudflare/agents/issues/2263), [#2264](https://github.com/cloudflare/agents/issues/2264)). See [Programmatic submissions](https://github.com/cloudflare/agents/blob/main/docs/think/programmatic-submissions.md).
+
+## 0.19.0
+
+### Minor Changes
+
+- [#2245](https://github.com/cloudflare/agents/pull/2245) [`beff78a`](https://github.com/cloudflare/agents/commit/beff78a8f7dbe6c6de303ed32b709876adba94f1) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Add the `Queue` Lifecycle capability (`agents/queue`) for durable background work. Each pushed item is a job in the Lifecycle job queue, due immediately, run from the alarm loop one at a time in push order with Lifecycle's retry, deadman, and memory-limit policy. Callbacks are registered in the constructor and typed at declaration and push; `push()` accepts a stable `id` (upsert) and per-item `retry`.
+
+  `Agent.queue()` and friends now delegate to the capability. Queued callbacks run from the alarm loop in a fresh invocation, so they no longer see the enqueuing request's `connection` or `request` through `getCurrentAgent()` (the agent itself is still available). The `cf_agents_queues` table and the in-isolate drain are gone; legacy rows migrate into the job queue on the next start. `queue()` accepts `options.id`; `dequeue`, `dequeueAll`, `dequeueAllByCallback`, `getQueue`, and `getQueues` are now asynchronous; and `QueueItem.created_at` is renamed `createdAt`. `LifecycleServices.starting()` is replaced by `status()`, which returns `"zero" | "starting" | "started"`.
+
+  Think's workflow-notification outbox and submission drain now run as queue items; the `cf_think_workflow_notifications` table migrates and is dropped on start.
+
+  Both one-shot migrations (`cf_agents_queues` in Queue, `cf_think_workflow_notifications` in Think) are temporary upgrade paths and will be removed in the next minor release, by which point every started object has migrated. Deployments skipping this release should upgrade through it. Workflow-notification delivery retries with backoff capped at ten minutes (previously five) and gives up after twelve hours of continuous failure (previously never), reporting the failure through `onError`.
+
+### Patch Changes
+
+- [#2304](https://github.com/cloudflare/agents/pull/2304) [`4f2e5a3`](https://github.com/cloudflare/agents/commit/4f2e5a32ab8bbf25399f8e955294c846af76738f) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Require `agents >=0.24.0` for Think's background work, which relies on the Queue capability's stable item IDs and alarm-driven execution.
+
+- [#2256](https://github.com/cloudflare/agents/pull/2256) [`ee6a8cf`](https://github.com/cloudflare/agents/commit/ee6a8cfaf50213cabcc8e823c91e773010b994f7) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Recover an interrupted Think turn that had opened its stream but persisted no content by re-running its user message instead of trying to continue it. Think opens the resumable stream row before inference, so a Durable Object reset in the window before the first chunk left a turn with a stream id, no partial, and a user message as the latest leaf; recovery classified it as `continue`, found no assistant message to continue from, and marked the incident `skipped`. A parent tailing such a child through agent tools then sealed the run as an error. This mirrors `AIChatAgent`'s empty-partial new-turn rule ([#1691](https://github.com/cloudflare/agents/issues/1691)).
+
+- [#2297](https://github.com/cloudflare/agents/pull/2297) [`0fd3c8b`](https://github.com/cloudflare/agents/commit/0fd3c8b9fe7e7805f18226114b925066e33904fe) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Preserve running durable submissions during startup when either a retry or continuation chat-recovery callback is still pending. This applies to both current Tasks recovery attempts and legacy scheduled callbacks, allowing interrupted empty streams to retry and complete after a restart instead of being marked as errors.
+
+  Keep recovery ownership until the successor chat turn is durably accepted, and bind the submission to that successor before handing off. Scope the handoff signal to the successor turn so concurrent turns cannot claim it, including facet-hosted turns after their legacy successor fiber is durably created. New recovery payloads carry stable submission identity; exact submission IDs take precedence over request-ID fallback, preventing collisions from recovering or terminalizing another submission. Record each turn's actual outcome and structured output on the submission row in the same transaction that settles its stream, so a restart between turn completion and ledger settlement records the completed, aborted, or errored outcome from recorded fact instead of inferring from stream state — without rerunning the turn or duplicating response callbacks: aborted turns stay aborted, recovered workflow completions keep their output, an overflow retry segment is never mistaken for an answer, and the recorded fact survives unrelated turns reclaiming stream rows.
+
+## 0.18.0
+
+### Minor Changes
+
+- [#2196](https://github.com/cloudflare/agents/pull/2196) [`ec93caf`](https://github.com/cloudflare/agents/commit/ec93caf6ec1efebb521aa9ab30c0a8cb2b4d50d5) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Replatform Think conversation storage onto `agents/sessions` and prompt context onto `agents/context`.
+
+  **Existing subclasses keep compiling and running.** `configureSession(session)` still accepts the `withContext()` / `withCachedPrompt()` chain, `this.session` still carries `addContext`, `getContextBlock`, `replaceContextBlock`, `refreshSystemPrompt`, `freezeSystemPrompt`, `tools()`, and the rest, and `appendMessage(message, parentId)` / `getHistory(leafId)` still take their positional arguments. Those context methods are deprecated forwards to the new `this.context`; new code should declare blocks in `configureContext()` and read `this.context` directly. `withCachedPrompt()` is a no-op because the frozen prompt is always persisted now.
+
+  **What you may want to change**
+
+  - Declare prompt blocks with the new `configureContext()` hook instead of `withContext()`. Blocks from both are merged, `configureContext()` first.
+  - Read context through `this.context` (a `ContextBlocks` from `agents/context`) instead of `this.session`.
+  - Import `Session` from `@cloudflare/think` when you annotate a `configureSession` override. The class exported from `agents/sessions` is the raw storage handle and is not assignable to Think's.
+
+  **Behaviour changes on upgrade**
+
+  - **Storage migrates on first wake and cannot be rolled back.** Each Durable Object lifts its `assistant_messages`, `assistant_compactions`, and `assistant_config` rows into the `cf_agents_session_*` tables, verifies every row landed, and drops the old tables. An object that has woken on this version has an empty conversation if you roll back to the previous release; rolling forward again is safe. Deploy behind a canary if you need a rollback path.
+  - `hydrationByteBudget` defaults to 32 MiB (was 24 MiB) and is now a hard ceiling that charges each row its full stored size, attachments included. There is no message-count floor, so an unusually large recent window can hydrate fewer than four messages. `getHistory()` still reads the full path.
+  - Context blocks load during `onStart`, as before the replatform, so `this.context.getBlock()` answers as soon as the object has started.
+  - `session.search()` still works. Its index is now built by the first search on an object rather than maintained on every append, so a Think that never searches stops paying a second billed row per message.
+  - Think no longer reads Sessions tables with raw SQL. If you queried `assistant_messages` yourself, use `this.session.history()` or `getHistory()`.
+
+  **Removed**
+
+  - `sessionAttachments`. There is nothing to configure about how Sessions stores a message: media leaves the row into a content-addressed attachment store and a message larger than one SQLite row is split across continuation rows, losslessly.
+  - `getRecentHistory(budget, minRecentMessages)`: the second argument is accepted and ignored.
+  - `compactAfter(threshold, { tokenCounter })`: the counter option is accepted and ignored; the trigger reads the estimate Sessions stamps on each row.
+
+- [#2175](https://github.com/cloudflare/agents/pull/2175) [`8ffb3ad`](https://github.com/cloudflare/agents/commit/8ffb3ad14a0aed72b047b8968981f10b141c700b) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Lifecycle owns a durable job queue, driven as an alarm event loop.
+
+  The thing in the queue is a job: a serialisable callback address — the
+  owning capability plus a function name — with a due time and a payload.
+  Capabilities and the host push jobs through the scoped `jobs` surface;
+  Lifecycle drives due jobs in timestamp order when the alarm fires, owns
+  dispatch retries and platform-failure deferral, arms a deadman pre-alarm
+  before driving so an isolate death mid-drive still wakes the object, and
+  derives the physical alarm purely from queue state (queue mutations re-arm
+  automatically; an exclusive job suppresses ordinary candidates).
+
+  ```ts
+  class Cleanup extends LifecycleCapability {
+    async scheduleSweep(time: number) {
+      await this.lifecycle.jobs.push({ id: "sweep", fn: "sweep", time });
+    }
+    onJob({ job }: LifecycleJobContext) {
+      // drive result: nothing = complete, { rescheduleAt } = suspend,
+      // "yield" = leave due and wake again immediately
+    }
+  }
+  ```
+
+  The pull-based alarm-contribution model is removed: capability
+  `getNextAlarm()`/`onAlarm()`, host `getNextAlarm()`,
+  `LifecycleServices.alarms` (`rearm`/`disabled`), and `AlarmContribution`
+  are gone. Host `onAlarm()` remains and runs once per alarm invocation
+  after due jobs are driven. Terminal application failures reach the
+  owner's `onJobError()`, whose drive result decides advancement.
+
+  The alarm memory-limit circuit breaker ([#1825](https://github.com/cloudflare/agents/issues/1825)) moves from `Agent.alarm()`
+  into the Lifecycle event loop, targeting the exact executing job; Agent
+  contributes domain policy through the new `onAlarmMemoryLimit()` host
+  hook, and Scheduler's `__DO_NOT_USE_WILL_BREAK__handleAlarmMemoryLimit`
+  escape hatch is gone. After recording a strike the breaker now finishes by
+  resetting the isolate with `ctx.abort(reason, { retryAlarm: false })`
+  (retry of the handled alarm suppressed; the backoff alarm owns the next
+  wake), and `Agent.destroy()` uses the same no-retry abort so a completed
+  teardown's alarm cannot be retried into a fresh constructor that recreates
+  the deleted schema.
+
+  Scheduler keeps its entire public API and loses its storage and due-row
+  loop: a schedule is one job whose `fn` is the callback name, and interval
+  schedules are single-flight jobs. Existing `cf_agents_schedules` rows are
+  migrated into the `cf_agents_jobs` queue on startup and the legacy table
+  is dropped. Agent's public scheduling and `keepAlive()` APIs are
+  unchanged; its keep-alive, fiber-recovery/facet housekeeping, and
+  deferred-destroy wakes are now host jobs, and Think's
+  workflow-notification wake replaces the removed `_getExtensionAlarm()`.
+
+- [#2196](https://github.com/cloudflare/agents/pull/2196) [`ec93caf`](https://github.com/cloudflare/agents/commit/ec93caf6ec1efebb521aa9ab30c0a8cb2b4d50d5) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Keep media eviction a context-window technique, separate from how Sessions stores a message.
+
+  How Sessions lays a message out in rows is invisible and lossless: a message too large for one row is split across continuation rows and reassembled byte for byte. Media eviction is a decision about the model's context: once media has aged past `mediaEviction.keepRecentMessages` on the active path, Think removes it from the conversation so the model stops re-reading a large image every turn, and leaves `[evicted image/png, 812004 bytes; preserved at /attachments/evicted/<messageId>-<n>.png]` in its place. The raw bytes are written to the Workspace at that path with their real mime type, so the workspace `read` tool puts the actual image back in context when the agent deliberately reads it. The rewritten message no longer carries the payload, so the bytes live in exactly one place.
+
+  `mediaEviction: false` now means the model keeps seeing aged media. It no longer changes where Sessions keeps the bytes.
+
+  `minPartBytes` is Think's context threshold and is no longer passed to Sessions as a storage setting. The marker text and the `/attachments/evicted/<id>-<n>.<ext>` paths are unchanged, so old markers keep resolving.
+
+  `MediaEvictionConfig.externalizeToWorkspace` is deprecated and ignored: evicted bytes are always preserved. Existing configurations keep compiling.
+
+  `WorkspaceLike.writeFileBytes` is optional. Eviction and skills projection need it to write raw bytes; a custom workspace without it keeps working and those two features log once and stand down.
+
+- [#2216](https://github.com/cloudflare/agents/pull/2216) [`dd09d44`](https://github.com/cloudflare/agents/commit/dd09d44913e60aa519aac51e53b13eac2111c732) Thanks [@mattzcarey](https://github.com/mattzcarey)! - feat(streams): rollover block log and an atomic stream → message cutover; no more stream-buffer sweeps.
+
+  The Streams chunk log is now mutable rollover blocks: an append grows the open block row (an UPDATE) until it reaches 256 KB, then opens the next. Same one billed row per append as before, but a stream of thousands of chunks is a handful of rows to delete instead of thousands. Existing `cf_agents_stream_chunks` rows are folded into blocks lazily, one stream at a time on first touch, so startup never reads the whole legacy log; the table is dropped once it is empty.
+
+  `writer.close({ commit, discard })` (and `error(reason, { … })`) settles the stream, runs the caller's synchronous writes and deletes the stream's rows in one SQLite transaction. `Session.__DO_NOT_USE_WILL_BREAK__sync().upsert()` is the matching synchronous message write; its `after()` dispatches the change feed and auto-compaction once the transaction commits.
+
+  Chat hosts (`AIChatAgent`, `Think`) now persist the finished turn's assistant message inside that cutover: the message, the stream's settlement and the deletion of its temporary rows commit together, so a crash leaves either the live stream (recovery rebuilds the message from it) or the message, never neither. `ResumableStream.start()` reclaims anything a crash left behind. The `_cleanupStreamBuffers` alarm is no longer armed (`cleanupStreamBuffers` and `STREAM_CLEANUP_DELAY_SECONDS` are removed from `agents/chat`; the host callback is kept as a no-op so alarms persisted by earlier versions still resolve).
+
+### Patch Changes
+
+- [#2194](https://github.com/cloudflare/agents/pull/2194) [`6da4c44`](https://github.com/cloudflare/agents/commit/6da4c44ba4ba778c2fd981b40adbba2b4f02ba37) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Run root-agent chat recovery continuations as chained Tasks instead of schedule rows. Initial recovery attempts deduplicate by incident, delayed retries use durable Task sleeps, and platform failures replay through Task claims. AI Chat and Think share one reserved recovery definition and preserve their existing bounded callback handoff behavior: a failure before handoff stays with the current queue execution, while a detached post-handoff platform failure enqueues exactly one replacement.
+
+  Tasks now propagate condemned-isolate failures out of journaled steps and apply alarm memory-limit backoff and sealing to the run whose wake struck — claim stripped and deadline pushed, so startup reconciliation cannot resurrect it and the reclaim still sees an interrupted attempt. Task wake jobs are pushed with a single dispatch attempt so a platform failure rejects the alarm instead of being retried into a silent reschedule of the still-claimed run. Lifecycle gains `trackAlarmWork()`: work a job hands off at a bounded return stays inside that alarm's memory-limit breaker domain after the alarm returns, so other jobs stay live while a memory reset from the handoff still records a strike — one strike per reset however many flows observe it — and strikes clear only once no handed-off work is outstanding and the last of it settled clean. `retain: false` now removes failed and cancelled runs as well as completed runs, releasing journals and idempotency keys after every terminal outcome. Routed dynamic agents temporarily retain the root-owned schedule transport until Tasks supports routed child wakes.
+
+  AI Chat and Think require `agents >=0.23.0`, the pending release batch containing the shared recovery Task definition and internal enqueue support.
+
+- [#2173](https://github.com/cloudflare/agents/pull/2173) [`71ce28a`](https://github.com/cloudflare/agents/commit/71ce28a83ee6677aae6a42c5b8d6e72db7310f16) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Replatform chat's resumable streams onto the `agents/streams` capability.
+
+  `ResumableStream` is now a thin adapter over `Streams`: chat's in-flight turn output lives in the shared durable chunk log (`cf_agents_streams` / `cf_agents_stream_chunks`), packed ~10 wire chunks per stored segment for write economy, with completion/error mapped onto stream settlement and retention keyed off the stream row's `updated_at` (sweeps no longer scan the chunk table). Existing `cf_ai_chat_stream_*` tables migrate wholesale — including an in-flight stream — on first construction after upgrade, then are dropped. `AIChatAgent` and `Think` expose the backing capability as `readonly streams`, so any `streams.read()` consumer on the same Durable Object can observe chat streams. The chat wire protocol, replay handshake, and recovery behavior are unchanged.
+
+- [#2223](https://github.com/cloudflare/agents/pull/2223) [`dd8bf90`](https://github.com/cloudflare/agents/commit/dd8bf9061298a38003751a59b70745a50e6557e7) Thanks [@mattzcarey](https://github.com/mattzcarey)! - perf(chat): derive the recovery forward-progress marker from the stream log instead of bumping a KV counter per credited chunk. `ResumableStream.progressMarker()` counts durably flushed segments — live streams from their log tails, deleted streams from a retired total folded in as their rows are removed — so the marker stays monotonic across cutover and reclaim, never moves on a reconnect replay or a recovery re-persist, and ignores compaction. A parent forwarding a sub-agent's output credits it explicitly through `creditProgress()`. Nothing is written per chunk any more; one row is written per stream retired. The old KV counter is read once per isolate and seeded into the marker so an in-flight incident never sees it drop, and the hosts mirror the marker's durable part back to that key per stream retired, so a rollback reads no lower either. The Streams sync aperture gains an `onDelete` hook so a chat row deleted through the public capability is retired like any other. `AIChatAgent` now flushes a settled tool result to SQLite the moment it is stored, as `Think` already did, so it is durable before the next packed flush and counts as progress immediately. The work budget's unit is now the durable segment, and `DEFAULT_CHAT_RECOVERY_MAX_WORK` moves from 1000 to 10000 to stay as generous as before for delta-heavy turns. Two cutover fixes ride along: a Think agent-tool child now keeps its stream rows for the parent to tail after completion, as ai-chat already did, and the Streams capability re-derives its legacy-table flag after a rolled-back cutover.
+
+- [#2219](https://github.com/cloudflare/agents/pull/2219) [`0966a0b`](https://github.com/cloudflare/agents/commit/0966a0b076cde9b4f04d29c12c469690fd65491f) Thanks [@mattzcarey](https://github.com/mattzcarey)! - perf(think): stop re-reading the transcript during a turn. A tool update (client result, approval, cross-message result, execution outcome) used to read the whole persisted history to find its one target message; it now resolves the owner from the in-flight accumulator and the live cache and reads that row alone, walking storage newest-first only when the cache does not cover the active path. A chat request no longer reads the path twice and upserts every echoed message: the cache is the server transcript, unchanged messages are skipped before Sessions sees them, and only what changed is written. The cache re-windows itself once appends carry it past `hydrationByteBudget`, and marks itself stale on Sessions `import` and `compaction` events. Media eviction is scheduled from an in-memory check on each linear append instead of a stored-path scan after every cache refresh, `think_config` rewrites of an unchanged request body or client-tool schemas are skipped, and the agent-tool child-run DDL runs once per isolate.
+
+- [#2190](https://github.com/cloudflare/agents/pull/2190) [`58c586a`](https://github.com/cloudflare/agents/commit/58c586aa179690f78a4327288fe27ee9875e8624) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Make the alarm memory-limit circuit breaker ([#1825](https://github.com/cloudflare/agents/issues/1825)) a self-contained
+  Lifecycle concern instead of an Agent-mediated one.
+
+  Recovery-loop membership is now a property of the job row
+  (`LifecycleJobPushOptions.recoveryLoop`): flagged jobs are backed off by
+  the breaker on a strike and purged when it seals at the strike budget,
+  without disturbing unrelated rows — a recovery schedule can no longer
+  silently escape the breaker. The public `ScheduleOptions` vocabulary is
+  unchanged: schedules only shape future work, and chat recovery reaches the
+  flag through internal scaffolding (`RecoveryLoopScheduleOptions`) retained
+  only for legacy rows and routed dynamic agents. Root recovery moves to Tasks;
+  the scaffolding can be deleted when Tasks supports routed child wakes.
+  Capabilities can react to a strike through the new optional `onMemoryLimit`
+  hook, hosts through `onAlarmMemoryLimit`, and the context identifies the job
+  that was executing when one exists. The strike budget is real Lifecycle
+  configuration (`Lifecycle.install(host, { maxAlarmMemoryLimitStrikes })`)
+  rather than a composition-root side channel. Until Tasks supports routed
+  child wakes, a sealed recovery schedule also forwards the seal to its owning
+  dynamic agent so a chat child under a plain Agent root persists its exhausted
+  incident and terminal notification.
+
+  Removed accordingly: `Agent.onAlarmMemoryLimit`'s policy relay, the
+  `_cf_recoveryAlarmCallbacks` template hook, `Scheduler.applyMemoryLimitPolicy`,
+  and
+  `setLifecycleAlarmMemoryLimitStrikes`. `AIChatAgent` and `Think` flag their
+  routed recovery fallback via `chatRecoverySchedulePolicy` and seal in-flight
+  incidents from their own protected `onAlarmMemoryLimit` hooks; both now
+  require `agents >= 0.23.0` from the pending release batch (they consume its
+  new `agents/chat` recovery exports and no longer implement the old
+  template-method breaker hooks). Agent retains a
+  sealed-only call to `_cf_sealMemoryLimitedRecovery` so already-published chat
+  packages whose peer ranges accept agents 0.23 keep terminal notifications;
+  that fallback carries no callback-name or queue policy.
+
+- [#2230](https://github.com/cloudflare/agents/pull/2230) [`e18d42f`](https://github.com/cloudflare/agents/commit/e18d42f48c84eb9bd944cb62124071e396cc964f) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Pass proactively compacted messages to `beforeStep` so hooks that append context do not restore the original history. Explicit message overrides still take precedence.
+
 ## 0.17.0
 
 ### Minor Changes
@@ -108,7 +424,7 @@
     helper and `result.stream` are v7-only.
   - The workspace read tool emits `{ type: "file-data", data, mediaType, filename }`
     model output, accepted by both majors (v7's newer `{ type: "file", data: {
-type: "data", data } }` shape does not exist in v6).
+    type: "data", data } }` shape does not exist in v6).
 
   Public API notes:
 

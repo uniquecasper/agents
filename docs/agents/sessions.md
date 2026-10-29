@@ -125,6 +125,19 @@ for await (const message of session.history()) {
 
 The capability first reads a content-free path of IDs and row sizes. It then fetches content in queries bounded to 50 rows and 4 MiB. Earlier chunks are not retained by the iterator.
 
+Read from the leaf when you are looking for something recent. The newest content window is fetched first, so breaking out of the loop leaves every older row unread:
+
+```ts
+for await (const message of session.history({ newestFirst: true })) {
+  if (ownsToolCall(message, toolCallId)) {
+    await session.updateMessage(applyResult(message));
+    break;
+  }
+}
+```
+
+A newest-first read follows parent pointers from the leaf, one row per message the loop actually takes, so its cost has no transcript term. Compaction overlays are honored: the walk stays row-by-row until it reaches the end of a compacted span, and only then plans the overlays over the remaining prefix and streams it leaf-first in eight-row windows.
+
 Use `historyBatches()` when each downstream operation has a fixed cost:
 
 ```ts
@@ -229,7 +242,23 @@ await session.addCompaction(summary, fromMessageId, toMessageId);
 
 Sessions stamps each message with a token estimate when the row is written. `compactAfter()` gates on that O(1) aggregate and never reads the transcript to decide whether to compact. Auto-compaction failures are non-fatal: they log, emit `session:error`, and leave the transcript alone.
 
-To trim a transcript before handing it to a model, `truncateOlderMessages` is exported from [`agents/chat`](./chat-agents.md), not from `agents/sessions`.
+To trim a transcript before handing it to a model, `truncateOlderMessages` is exported from [`agents/chat`](./chat-agents.md), not from `agents/sessions`. If your tools define `toModelOutput`, a truncated tool output may no longer match the tool's output schema. In that case, pass `toolOutputs: false` to `truncateOlderMessages` and call `truncateOlderToolResults` on the result of `convertToModelMessages`, which truncates what the model reads after `toModelOutput` has run. Provider-executed tool outputs are never truncated.
+
+With the default `keepRecent`, the truncation cutoff moves forward by one message whenever a message is added, so every turn rewrites a message near the end of the prompt and invalidates the provider's prompt cache from that point. To keep the prefix stable, move the cutoff in steps and pass the same `keepRecent` to both functions:
+
+```ts
+const step = 8;
+const keepRecent = history.length <= 4 ? 4 : 4 + ((history.length - 4) % step);
+const truncated = truncateOlderMessages(history, {
+  keepRecent,
+  toolOutputs: false
+});
+const modelMessages = truncateOlderToolResults(
+  await convertToModelMessages(truncated, { tools }),
+  truncated,
+  { keepRecent }
+);
+```
 
 ## Large messages
 
@@ -320,11 +349,36 @@ const unsubscribe = sessions.subscribe(async (event) => {
     case "delete":
     case "clear":
     case "compact":
+    case "compaction":
       await refreshProjection();
+      break;
+    case "import":
+      markProjectionStale();
       break;
   }
 });
 ```
+
+`import` fires once per `importMessage()` and carries the row; it is deliberately not an `append`, so a projection does not patch itself per imported row during a migration — it marks itself stale and re-derives once. `compaction` fires when an overlay is stored directly through `addCompaction()`; `compact()` reports its own overlay as `compact`.
+
+A host that keeps an in-memory transcript does not need to write that reduction itself. `session.mirror()` subscribes for one session and patches an array in place: an append or update replaces the entry with the same id (or pushes a new row), a delete filters, and a clear empties it:
+
+```ts
+const stop = sessions.session("").mirror<UIMessage>({
+  get: () => this.messages,
+  set: (messages) => {
+    this.messages = messages;
+  },
+  transform: (message) => toCachedMessage(message),
+  intercept: async (event) => {
+    if (event.type !== "compact") return false;
+    this.messages = await reloadFromStorage();
+    return true;
+  }
+});
+```
+
+`get()` is read on every event, so reassigning the array is safe. `intercept` handles an event instead of the default reduction. Use it for changes an in-place patch cannot express, such as a branch append or a compaction. `onApplied` runs after an append or update was written, with the entry it replaced.
 
 This is a local cache-coherence feed, not a cross-object event log. Capability diagnostics are also emitted through Lifecycle observability.
 

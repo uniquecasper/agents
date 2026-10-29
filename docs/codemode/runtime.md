@@ -138,6 +138,10 @@ In practice, model-generated code is naturally deterministic — it fetches data
 
 **Issue tool calls sequentially.** The replay cursor assigns each call its sequence number when the call reaches the host, so `await a(); await b();` is stable across runs but `await Promise.all([a(), b()])` is not — the two calls can arrive in either order. On a run that never pauses this is harmless, but if such a run later pauses and resumes, the reordered calls trip divergence detection. Await connector calls one at a time in any run that might pause for approval.
 
+## Unawaited tool calls
+
+A program can return before a tool call it started has finished, for example `async () => { github.ping(); return 1; }`. When `execute()` settles, the sandbox gets an error for each call still pending, so it can exit and free its Dynamic Worker concurrency slot. The host keeps running those calls to completion, so fire-and-forget calls still take effect, but the program never sees their results.
+
 ## The tool-call log
 
 ```ts
@@ -232,7 +236,9 @@ const runtime = createCodemodeRuntime({
 });
 ```
 
-`truncateResult(value, options?)` returns the value unchanged when its serialized size is within budget, and a truncated string (with a marker noting the original size) when it isn't. `truncateResponse(text, options?)` is the string-only variant. Both take `{ maxChars?, maxTokens? }` (default ~6000 tokens).
+`truncateResult(value, options?)` returns the value unchanged when its serialized size is within budget. When it isn't, the value is shrunk structurally — largest values first — so the model still receives valid JSON of the original shape: a clipped string ends with `--- TRUNCATED --- <n> chars`, a clipped array ends with a `--- TRUNCATED --- <n> more items` element, and an object that had to lose entries gains a `"--- TRUNCATED ---"` entry naming the omitted keys. `truncateResponse(text, options?)` is the string-only variant. Both take `{ maxChars?, maxTokens? }` (default ~6000 tokens).
+
+The tool's `toModelOutput` sends the model everything but `calls`, with `logs` bounded the same way: the durable call log (every connector call's args and result) stays on the persisted tool part for UIs and audit, and is never part of the model's context.
 
 `transformResult` shapes only the final returned value — individual connector results inside the run are unaffected, so the model's own code still sees full data to reason over.
 

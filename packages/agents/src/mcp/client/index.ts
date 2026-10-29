@@ -16,6 +16,17 @@ import type {
   Tool
 } from "@modelcontextprotocol/client";
 export type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/client";
+export {
+  RPC_DO_PREFIX,
+  RPCClientTransport,
+  type McpRpcAgent,
+  type RPCClientTransportOptions
+} from "../rpc";
+export type {
+  MCPElicitationHandler,
+  MCPElicitationHandlers
+} from "./connection";
+export type { McpClientOptions } from "../types";
 import { type RetryOptions, tryN } from "../../retries";
 import { z } from "zod";
 import { nanoid } from "nanoid";
@@ -384,8 +395,7 @@ export type MCPServerFilter = {
 
 /**
  * A Durable Object capability that persists and aggregates MCP client
- * connections. Installing it directly on a Lifecycle (outside `agent.mcp`)
- * is experimental: that capability surface may change before stabilizing.
+ * connections. Install it on any Lifecycle, or use `agent.mcp` on an Agent.
  */
 export class MCPClientManager extends LifecycleCapability {
   public mcpConnections: Record<string, MCPClientConnection> = {};
@@ -2259,15 +2269,67 @@ export class MCPClientManager extends LifecycleCapability {
    * Remove an MCP server - closes connection if active and removes from storage.
    */
   async removeServer(serverId: string): Promise<void> {
-    if (this.mcpConnections[serverId]) {
+    const connection = this.mcpConnections[serverId];
+    let authProvider = connection?.options.transport.authProvider;
+    if (!authProvider) {
+      // A user-supplied provider factory can throw; that must not stop the
+      // server from being removed.
+      try {
+        authProvider = this.authProviderFromStorage(serverId);
+      } catch (error) {
+        console.warn(
+          `[MCPClientManager] Failed to create auth provider for ${serverId}:`,
+          error
+        );
+      }
+    }
+    if (connection) {
       try {
         await this.closeConnection(serverId);
       } catch (_e) {
         // Ignore errors when closing
       }
     }
+    // Clear this server's saved OAuth state. This only deletes local state;
+    // it does not revoke tokens at the OAuth provider.
+    try {
+      if (authProvider instanceof DurableObjectOAuthClientProvider) {
+        await authProvider.clearServerStorage();
+      } else {
+        await authProvider?.invalidateCredentials?.("all");
+      }
+    } catch (error) {
+      console.warn(
+        `[MCPClientManager] Failed to clear OAuth credentials for ${serverId}:`,
+        error
+      );
+    }
     this.removeServerFromStorage(serverId);
     this._onServerStateChanged.fire();
+  }
+
+  /**
+   * Rebuild a server's auth provider from its stored row, as restore does,
+   * for a server with no live connection.
+   */
+  private authProviderFromStorage(
+    serverId: string
+  ): AgentMcpOAuthProvider | undefined {
+    const server = this.getServersFromStorage().find((s) => s.id === serverId);
+    if (!server?.callback_url) return undefined;
+    const authProvider = this._createAuthProviderFn
+      ? this._createAuthProviderFn(server.callback_url)
+      : this.createAuthProvider(
+          server.id,
+          server.callback_url,
+          this._name,
+          server.client_id ?? undefined
+        );
+    authProvider.serverId = server.id;
+    if (server.client_id) {
+      authProvider.clientId = server.client_id;
+    }
+    return authProvider;
   }
 
   /**

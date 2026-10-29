@@ -47,7 +47,8 @@ import {
 import {
   CF_SUB_AGENT_OUTER_URL_KEY,
   CF_SUB_AGENT_TAGS_KEY,
-  SUB_AGENT_OUTER_URL_HEADER
+  SUB_AGENT_OUTER_URL_HEADER,
+  rejectSubAgentWebSocket
 } from "./dynamic-agents/dynamic-agents";
 import { logicalNameFromPathV2Identity } from "./dynamic-agents/identity";
 import { DynamicAgentsInternal } from "./dynamic-agents/dynamic-agents";
@@ -91,13 +92,24 @@ import {
   type WSMessage
 } from "./lifecycle/durable-object-lifecycle";
 import { abortWithoutAlarmRetry } from "./lifecycle/abort";
+import type { InternalHostMessage } from "./browser/internal-hosts";
+import { browserCapabilityId } from "./browser/capability-id";
 import type { LifecycleRouteAddress } from "./lifecycle/capability";
 import {
   getCurrentAgent as getCurrentLifecycleAgent,
   type CurrentAgentContext
 } from "./lifecycle/current-agent";
 import { getAgentByName, type AgentOptions } from "./agent-routing";
-import { callablesFromDecorated, WebSockets } from "./websockets";
+import { WebSockets } from "./websockets";
+import {
+  ensureConnectionWrapped,
+  getConnectionFlag,
+  isConnectionProtocolEnabled as connectionProtocolEnabled,
+  isConnectionReadonly as connectionReadonly,
+  registerInternalConnectionKeys,
+  setConnectionFlag,
+  setConnectionReadonly as markConnectionReadonly
+} from "./websockets/connection-flags";
 export {
   getAgentByName,
   routeAgentRequest,
@@ -142,7 +154,7 @@ import {
   genericObservability,
   type Observability,
   type ObservabilityEvent
-} from "./observability";
+} from "./observability/emitter";
 import { agentSpanAttributes } from "./observability/agent-span-attributes";
 import { tracer } from "./observability/tracing/cloudflare";
 import {
@@ -153,10 +165,12 @@ import {
 } from "./observability/tracing/tracer";
 import { DisposableStore } from "./core/events";
 import { MessageType } from "./types";
-import { RPC_DO_PREFIX } from "./mcp/rpc";
+import { RPC_DO_PREFIX, type McpRpcAgent } from "./mcp/rpc";
 import { ensureMcpServerTable } from "./mcp/client/storage";
-import type { McpAgent } from "./mcp";
 import { Scheduler, setSchedulerCallbackResolver } from "./schedules/scheduler";
+import { Queue, setQueueCallbackResolver } from "./queue/queue";
+import type { QueueItem } from "./queue/types";
+export type { QueueItem } from "./queue/types";
 import {
   Tasks,
   setTaskDefinitionResolver,
@@ -173,13 +187,15 @@ export type {
   ScheduleCriteria,
   ScheduleOptions
 } from "./schedules/types";
+import { State } from "./state";
 export {
   AGENT_TOOL_PROGRESS_PART,
   AGENT_TOOL_MILESTONE_PART
 } from "./agent-tool-types";
 import {
   AGENT_TOOL_MILESTONE_PART,
-  AGENT_TOOL_PROGRESS_PART
+  AGENT_TOOL_PROGRESS_PART,
+  isAgentToolLifecycleChunk
 } from "./agent-tool-types";
 import type {
   AgentToolChildAdapter,
@@ -206,6 +222,7 @@ export type {
   AgentToolChildAdapter,
   AgentToolDisplayMetadata,
   AgentToolEvent,
+  AgentToolEventDelivery,
   AgentToolEventMessage,
   AgentToolEventState,
   AgentToolFailure,
@@ -324,16 +341,6 @@ function isRPCRequest(msg: unknown): msg is RPCRequest {
 /**
  * Type guard for state update messages
  */
-function isStateUpdateMessage(msg: unknown): msg is StateUpdateMessage {
-  return (
-    typeof msg === "object" &&
-    msg !== null &&
-    "type" in msg &&
-    msg.type === MessageType.CF_AGENT_STATE &&
-    "state" in msg
-  );
-}
-
 export {
   callable,
   unstable_callable,
@@ -348,14 +355,6 @@ import {
 } from "./callable-decorator";
 
 export { SqlError } from "./sql-error";
-
-export type QueueItem<T = string> = {
-  id: string;
-  payload: T;
-  callback: keyof Agent<Cloudflare.Env>;
-  created_at: number;
-  retry?: RetryOptions;
-};
 
 type AgentToolRunStorageRow = {
   run_id: string;
@@ -689,9 +688,9 @@ const FIBER_RECOVERY_BACKOFF_MAX_EXP = 20;
 // budget abandoned healthy, still-advancing children); only a genuinely
 // silent/hung child seals `interrupted` after a full no-progress window.
 const DEFAULT_AGENT_TOOL_REATTACH_NO_PROGRESS_TIMEOUT_MS = 120_000;
-// Optional hard wall-clock ceiling on a single re-attach. Defaults to NO cap,
-// mirroring chat-recovery's `maxRecoveryWork: Infinity` (#1672): the SDK does
-// not impose an implicit wall-clock bound on a child that keeps making forward
+// Optional hard wall-clock ceiling on a single re-attach. Defaults to NO cap
+// (#1672): the SDK does not impose an implicit wall-clock bound on a child that
+// keeps making forward
 // progress — a re-attached parent follows a healthy, still-streaming child for
 // as long as it advances, exactly as it would on the live (never-evicted) path.
 // A hung/silent child is already bounded by the progress-keyed no-progress
@@ -751,31 +750,22 @@ type AgentToolRecoveryInspection =
 /**
  * Schema version for the Agent's internal SQLite tables.
  * Bump this when adding new tables, columns, or migrations.
- * The constructor stores this as a row in cf_agents_state and checks it
- * on wake to skip DDL on established DOs.
+ * The constructor stores this under a namespaced KV key (the same convention
+ * every capability uses for its own schema version) and checks it on wake to
+ * skip DDL on established DOs.
  */
-const CURRENT_SCHEMA_VERSION = 11;
+const CURRENT_SCHEMA_VERSION = 14;
+const SCHEMA_VERSION_KEY = "cf_agents:schema_version";
 
-const SCHEMA_VERSION_ROW_ID = "cf_schema_version";
-const STATE_ROW_ID = "cf_state_row_id";
-// Legacy key — no longer written, but read for backward compatibility with
-// DOs that were created before the single-row state optimization.
-const STATE_WAS_CHANGED = "cf_state_was_changed";
+// Before the State capability owned `cf_agents_state`, Agent kept its schema
+// version as a row in that table. Read once for DOs created under that layout,
+// then moved to the KV key so the table has a single owner.
+const LEGACY_SCHEMA_VERSION_ROW_ID = "cf_schema_version";
 
+// Sentinel for "no initial state provided" on the Agent's overridable
+// `initialState` field. The State capability owns state storage; this only
+// distinguishes an unset initialState when the `state` getter seeds it.
 const DEFAULT_STATE = {} as unknown;
-
-/**
- * Internal key used to store the readonly flag in connection state.
- * Prefixed with _cf_ to avoid collision with user state keys.
- */
-const CF_READONLY_KEY = "_cf_readonly";
-
-/**
- * Internal key used to store the no-protocol flag in connection state.
- * When set, protocol messages (identity, state sync, MCP servers) are not
- * sent to this connection — neither on connect nor via broadcasts.
- */
-const CF_NO_PROTOCOL_KEY = "_cf_no_protocol";
 
 /**
  * Internal key used to store voice call state in connection state.
@@ -783,53 +773,14 @@ const CF_NO_PROTOCOL_KEY = "_cf_no_protocol";
  */
 const CF_VOICE_IN_CALL_KEY = "_cf_voiceInCall";
 
-/**
- * The set of all internal keys stored in connection state that must be
- * hidden from user code and preserved across setState calls.
- */
-const CF_INTERNAL_KEYS: ReadonlySet<string> = new Set([
-  CF_READONLY_KEY,
-  CF_NO_PROTOCOL_KEY,
+// Agent's own per-connection flags ride the WebSockets capability's
+// connection-state namespace: hidden from `connection.state`, preserved
+// across user `setState`, and carried through hibernation.
+registerInternalConnectionKeys(
   CF_VOICE_IN_CALL_KEY,
   CF_SUB_AGENT_OUTER_URL_KEY,
   CF_SUB_AGENT_TAGS_KEY
-]);
-
-/** Check if a raw connection state object contains any internal keys. */
-function rawHasInternalKeys(raw: Record<string, unknown>): boolean {
-  for (const key of Object.keys(raw)) {
-    if (CF_INTERNAL_KEYS.has(key)) return true;
-  }
-  return false;
-}
-
-/** Return a copy of `raw` with all internal keys removed, or null if no user keys remain. */
-function stripInternalKeys(
-  raw: Record<string, unknown>
-): Record<string, unknown> | null {
-  const result: Record<string, unknown> = {};
-  let hasUserKeys = false;
-  for (const key of Object.keys(raw)) {
-    if (!CF_INTERNAL_KEYS.has(key)) {
-      result[key] = raw[key];
-      hasUserKeys = true;
-    }
-  }
-  return hasUserKeys ? result : null;
-}
-
-/** Return a copy containing only the internal keys present in `raw`. */
-function extractInternalFlags(
-  raw: Record<string, unknown>
-): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  for (const key of Object.keys(raw)) {
-    if (CF_INTERNAL_KEYS.has(key)) {
-      result[key] = raw[key];
-    }
-  }
-  return result;
-}
+);
 
 /** Max length for error strings broadcast to clients. */
 const MAX_ERROR_STRING_LENGTH = 500;
@@ -915,9 +866,9 @@ export const DEFAULT_AGENT_STATIC_OPTIONS = {
   /**
    * Optional hard wall-clock ceiling (ms) on a single agent-tool re-attach
    * (#1630). Caps the total wait even as the no-progress budget re-arms across
-   * stream-closes. Defaults to `Infinity` (no implicit cap), mirroring
-   * chat-recovery's `maxRecoveryWork` (#1672): a healthy, still-advancing child
-   * is followed for as long as it makes progress — a hung child is bounded by
+   * stream-closes. Defaults to `Infinity` (no implicit cap, #1672): a healthy,
+   * still-advancing child is followed for as long as it makes progress — a
+   * hung child is bounded by
    * the no-progress budget, and a content-runaway by the child's own
    * `maxRecoveryWork` / `shouldKeepRecovering`. Set a finite value to impose a
    * wall-clock cap (which also tears the child down on `window-exceeded`).
@@ -1006,9 +957,9 @@ export interface AgentStaticOptions {
   /**
    * Optional hard wall-clock ceiling in milliseconds on a single agent-tool
    * re-attach (#1630). Caps the total wait even as the no-progress budget
-   * re-arms across stream-closes. Default: `Infinity` (no implicit cap),
-   * mirroring chat-recovery's `maxRecoveryWork` (#1672) — a healthy,
-   * still-advancing child is followed for as long as it makes progress, exactly
+   * re-arms across stream-closes. Default: `Infinity` (no implicit cap,
+   * #1672) — a healthy, still-advancing child is followed for as long as it
+   * makes progress, exactly
    * as on the live (never-evicted) path. Set a finite value to impose a
    * wall-clock cap (which also tears the child down on `window-exceeded`); `0`
    * also disables the ceiling.
@@ -1043,43 +994,14 @@ export interface AgentStaticOptions {
    * reset (the isolate exceeded its 128 MB limit) before the alarm-boundary
    * circuit breaker stops the platform's auto-retry loop and seals the looping
    * recovery work (#1825). Default: 3. Set to `0` to seal on the first such
-   * reset. This is the universal backstop for the case where the in-DO recovery
-   * budgets (`chatRecovery.maxOomRetries` / `maxRecoveryWork`) can't engage
-   * because the OOM bypasses them — e.g. it is thrown before the budget code
-   * runs, or its own writes also OOM. The boundary handler runs at the outermost
-   * alarm frame, after the heavy turn has unwound and GC has reclaimed its
-   * footprint, so its small seal/purge writes can land where mid-turn writes
-   * could not.
+   * reset. The strike counter is written after the reset, so it only advances
+   * when that isolate's storage still accepts writes, for example when the
+   * reset error came from another isolate such as D1. A Durable Object's own
+   * memory-limit reset rejects every later storage call in that invocation, so
+   * chat recovery does not rely on this counter: it counts each interrupted
+   * attempt in the next isolate (`chatRecovery.maxInterruptedAttempts`, #2613).
    */
   maxAlarmMemoryLimitStrikes?: number;
-}
-
-/**
- * Parse the raw `retry_options` TEXT column from a SQLite row into a
- * typed `RetryOptions` object, or `undefined` if not set.
- */
-function parseRetryOptions(
-  row: Record<string, unknown>
-): RetryOptions | undefined {
-  const raw = row.retry_options;
-  if (typeof raw !== "string") return undefined;
-  return JSON.parse(raw) as RetryOptions;
-}
-
-/**
- * Resolve per-task retry options against class-level defaults and call
- * `tryN`. This is the retry-execution path for queue flush; Scheduler owns
- * its own copy for schedule callbacks.
- */
-function resolveRetryConfig(
-  taskRetry: RetryOptions | undefined,
-  defaults: Required<RetryOptions>
-): { maxAttempts: number; baseDelayMs: number; maxDelayMs: number } {
-  return {
-    maxAttempts: taskRetry?.maxAttempts ?? defaults.maxAttempts,
-    baseDelayMs: taskRetry?.baseDelayMs ?? defaults.baseDelayMs,
-    maxDelayMs: taskRetry?.maxDelayMs ?? defaults.maxDelayMs
-  };
 }
 
 // `isDurableObjectCodeUpdateReset` / `isPlatformTransientError` live in
@@ -1091,10 +1013,22 @@ export const getCurrentAgent = getCurrentLifecycleAgent as <
   T extends DurableObject = Agent<Cloudflare.Env>
 >() => CurrentAgentContext<T, AgentEmail>;
 
+const AsyncFunction: Function = Object.getPrototypeOf(
+  async () => {}
+).constructor;
+
+/** Functions produced by {@link withAgentContext}, so they are wrapped once. */
+const agentContextWrappers = new WeakSet<Function>();
+
 /**
  * Restore Agent context when a public method is entered outside a Lifecycle
  * hook, notably through native Durable Object RPC or cross-Agent re-entry.
  * Lifecycle already owns context for its capability and semantic user hooks.
+ *
+ * Native RPC bypasses the lifecycle's runtime handlers, so an `async` method
+ * entered from outside this Agent's context first starts the lifecycle when
+ * the call is the one that wakes a cold instance. Synchronous methods are
+ * never deferred, so they keep their synchronous return type.
  */
 
 // oxlint-disable-next-line @typescript-eslint/no-explicit-any -- generic callable constraint
@@ -1104,7 +1038,10 @@ function withAgentContext<T extends (...args: any[]) => any>(
   this: Agent<Cloudflare.Env, unknown>,
   ...args: Parameters<T>
 ) => ReturnType<T> {
-  return function (...args: Parameters<T>): ReturnType<T> {
+  const enter = function (
+    this: Agent<Cloudflare.Env, unknown>,
+    ...args: Parameters<T>
+  ): ReturnType<T> {
     const { agent } = getCurrentAgent();
 
     if (agent === this) {
@@ -1125,6 +1062,26 @@ function withAgentContext<T extends (...args: any[]) => any>(
       }
     );
   };
+
+  if (!(method instanceof AsyncFunction)) {
+    agentContextWrappers.add(enter);
+    return enter;
+  }
+
+  const enterStarted = async function (
+    this: Agent<Cloudflare.Env, unknown>,
+    ...args: Parameters<T>
+  ): Promise<unknown> {
+    if (getCurrentAgent().agent !== this && !this.lifecycle.isStarted()) {
+      await this.lifecycle.start();
+    }
+    return enter.apply(this, args);
+  };
+  agentContextWrappers.add(enterStarted);
+  return enterStarted as unknown as (
+    this: Agent<Cloudflare.Env, unknown>,
+    ...args: Parameters<T>
+  ) => ReturnType<T>;
 }
 
 /**
@@ -1145,17 +1102,15 @@ type WorkflowName<E> = WorkflowBinding<E> | (string & {});
 /**
  * Base class for creating Agent implementations
  * @template Env Environment type containing bindings
- * @template State State type to store within the Agent
+ * @template TState State type to store within the Agent
  */
 export class Agent<
   Env extends Cloudflare.Env = Cloudflare.Env,
-  State = unknown,
-  Props extends Record<string, unknown> = Record<string, unknown>
+  TState = unknown,
+  Props extends object = object
 > extends DurableObject<Env> {
   /**
    * Runtime lifecycle and reusable durable capabilities for this Agent.
-   *
-   * @experimental The API surface may change before stabilizing.
    */
   readonly lifecycle = Lifecycle.install<Env, Props>(this, {
     maxAlarmMemoryLimitStrikes: this._resolvedOptions.maxAlarmMemoryLimitStrikes
@@ -1171,6 +1126,22 @@ export class Agent<
    * from paths that do not pass through the capability (facet bridging,
    * direct calls).
    */
+  /**
+   * Durable state: the `cf_agents_state` row, lazy load, validated persistence.
+   * `initialState` stays on Agent (a subclass field, initialized after this
+   * one) and is seeded by the `state` getter. Typed `<unknown>` rather than
+   * `<TState>` because `TState` appears in both `get()` and `set()` positions,
+   * which would make `Agent`'s own `TState` parameter invariant and break
+   * `Subclass -> Agent<Env, unknown>` assignability; the typed boundary is
+   * re-established in `state` / `setState`.
+   */
+  readonly _state: State<unknown> = new State<unknown>({
+    validateStateChange: (nextState, source) =>
+      this.validateStateChange(nextState as TState, source),
+    onChanged: (nextState, source) =>
+      this._handleStateChanged(nextState as TState, source)
+  });
+
   private readonly _webSockets = new WebSockets({
     handlers: {
       onConnect: (connection, ctx) => this.onConnect(connection, ctx),
@@ -1179,12 +1150,13 @@ export class Agent<
         this.onClose(connection, code, reason, wasClean),
       onError: (connection, error) => this.onError(connection, error)
     },
-    // Agent's callable interface comes from its existing public
-    // surface — @callable()-decorated methods — served here over the
-    // Cap'n Web endpoint and, natively, over the legacy JSON RPC
-    // protocol: one interface on every wire, no new Agent members.
-    // Capability hosts pass an RpcTarget directly instead.
-    callables: callablesFromDecorated(this),
+    // Agent answers its own rpc frames in onMessage (facet bridging,
+    // StreamingResponse). It also drives the connect sequence itself —
+    // `sendIdentity`/`sendState` after deciding whether the connection
+    // belongs to a facet — so the capability provides the protocol but
+    // does not run it: `protocol: false`.
+    protocol: false,
+    state: this._state,
     getConnectionTags: (connection, ctx) =>
       this.getConnectionTags(connection, ctx)
   });
@@ -1230,7 +1202,6 @@ export class Agent<
     await this.lifecycle.start(props);
   }
 
-  private _state = DEFAULT_STATE as State;
   private _disposables = new DisposableStore();
   private _destroyed = false;
 
@@ -1239,13 +1210,6 @@ export class Agent<
    * Used by internal flag methods (readonly, no-protocol) to read/write
    * _cf_-prefixed keys without going through the user-facing state/setState.
    */
-  private _rawStateAccessors = new WeakMap<
-    Connection,
-    {
-      getRaw: () => Record<string, unknown> | null;
-      setRaw: (state: unknown) => unknown;
-    }
-  >();
 
   /**
    * Cached persistence-hook dispatch mode, computed once in the constructor.
@@ -1350,17 +1314,22 @@ export class Agent<
   /** @internal Edge-trigger latch for the live-detached-count warning. */
   private _detachedLiveCountWarned = false;
 
-  private _ParentClass: typeof Agent<Env, State> =
+  private _ParentClass: typeof Agent<Env, TState> =
     Object.getPrototypeOf(this).constructor;
 
   /**
    * Durable scheduling capability installed into this Agent's Lifecycle.
-   *
-   * @experimental The API surface may change before stabilizing. Agent's
-   * schedule()/scheduleEvery()/getScheduleById()/listSchedules()/
-   * cancelSchedule() methods are the stable surface.
+   * Agent's schedule()/scheduleEvery()/getScheduleById()/listSchedules()/
+   * cancelSchedule() methods delegate to it.
    */
   readonly scheduler: Scheduler;
+
+  /**
+   * Durable background-work capability installed into this Agent's
+   * Lifecycle. Agent's queue()/dequeue()/dequeueAll()/dequeueAllByCallback()/
+   * getQueue()/getQueues() methods are its surface.
+   */
+  private readonly _queue: Queue;
 
   /**
    * Durable replayable execution capability installed into this Agent's
@@ -1396,7 +1365,7 @@ export class Agent<
    * Initial state for the Agent
    * Override to provide default state values
    */
-  initialState: State = DEFAULT_STATE as State;
+  initialState: TState = DEFAULT_STATE as TState;
 
   /**
    * Stable key for Workers AI session affinity (prefix-cache optimization).
@@ -1420,54 +1389,20 @@ export class Agent<
   }
 
   /**
-   * Current state of the Agent
+   * Current state of the Agent.
+   *
+   * Delegates to the State capability, which owns lazy load and the
+   * in-memory cache; Agent seeds `initialState` on first access.
    */
-  get state(): State {
-    if (this._state !== DEFAULT_STATE) {
-      // state was previously set, and populated internal state
-      return this._state;
-    }
-    // looks like this is the first time the state is being accessed
-    // check if the state was set in a previous life
-    const result = this.sql<{ state: State | undefined }>`
-      SELECT state FROM cf_agents_state WHERE id = ${STATE_ROW_ID}
-    `;
-
-    // Row existence is the signal that state was previously set.
-    // This handles all values including falsy ones (null, 0, false, "").
-    if (result.length > 0) {
-      const state = result[0].state as string;
-
-      try {
-        this._state = JSON.parse(state);
-      } catch (e) {
-        console.error(
-          "Failed to parse stored state, falling back to initialState:",
-          e
-        );
-        if (this.initialState !== DEFAULT_STATE) {
-          this._state = this.initialState;
-          // Persist the fixed state to prevent future parse errors
-          this._setStateInternal(this.initialState);
-        } else {
-          // No initialState defined - clear corrupted data to prevent infinite retry loop
-          this.sql`DELETE FROM cf_agents_state WHERE id = ${STATE_ROW_ID}`;
-          return undefined as State;
-        }
-      }
-      return this._state;
-    }
-
-    // ok, this is the first time the state is being accessed
-    // and the state was not set in a previous life
-    // so we need to set the initial state (if provided)
-    if (this.initialState === DEFAULT_STATE) {
-      // no initial state provided, so we return undefined
-      return undefined as State;
-    }
-    // initial state provided, so we set the state,
-    // update db and return the initial state
-    this._setStateInternal(this.initialState);
+  get state(): TState {
+    const stored = this._state.get();
+    // `undefined` is not JSON-representable, so it uniquely means "no row":
+    // nothing stored yet, or a corrupt row the capability just cleared.
+    if (stored !== undefined) return stored as TState;
+    if (this.initialState === DEFAULT_STATE) return undefined as TState;
+    // First access with nothing stored: seed the initial state. Goes through
+    // set() so it persists, broadcasts, and runs the notification hook.
+    this._state.set(this.initialState, "server");
     return this.initialState;
   }
 
@@ -1655,35 +1590,15 @@ export class Agent<
    */
   protected _ensureSchema(): void {
     // Schema version gating: skip all DDL on established DOs whose schema
-    // is already up-to-date. We always create cf_agents_state first (cheap
-    // idempotent DDL) and store the version as a row inside it.
-    this.sql`
-      CREATE TABLE IF NOT EXISTS cf_agents_state (
-        id TEXT PRIMARY KEY NOT NULL,
-        state TEXT
-      )
-    `;
-
-    const versionRow = this.sql<{ state: string | null }>`
-      SELECT state FROM cf_agents_state WHERE id = ${SCHEMA_VERSION_ROW_ID}
-    `;
-    const schemaVersion =
-      versionRow.length > 0 ? Number(versionRow[0].state) : 0;
+    // is already up-to-date. `cf_agents_state` belongs to the State
+    // capability (state/index.ts), which creates and migrates it itself.
+    const schemaVersion = this._readSchemaVersion();
 
     if (schemaVersion < CURRENT_SCHEMA_VERSION) {
       ensureMcpServerTable(this.ctx.storage);
 
-      this.sql`
-        CREATE TABLE IF NOT EXISTS cf_agents_queues (
-          id TEXT PRIMARY KEY NOT NULL,
-          payload TEXT,
-          callback TEXT,
-          created_at INTEGER DEFAULT (unixepoch())
-        )
-      `;
-
-      // Migration: add queue retry options for existing agents.
-      // Schedule schema and migrations are owned by Scheduler.
+      // Queue and schedule schema and migrations are owned by the Queue and
+      // Scheduler capabilities.
       const addColumnIfNotExists = (sql: string) => {
         try {
           this.ctx.storage.sql.exec(sql);
@@ -1695,10 +1610,6 @@ export class Agent<
           }
         }
       };
-
-      addColumnIfNotExists(
-        "ALTER TABLE cf_agents_queues ADD COLUMN retry_options TEXT"
-      );
 
       // Workflow tracking table for Agent-Workflow integration
       this.sql`
@@ -1728,19 +1639,16 @@ export class Agent<
         CREATE INDEX IF NOT EXISTS idx_workflows_name ON cf_agents_workflows(workflow_name)
       `;
 
-      // Clean up legacy STATE_WAS_CHANGED rows from the single-row state optimization
-      this.ctx.storage.sql.exec(
-        "DELETE FROM cf_agents_state WHERE id = ?",
-        STATE_WAS_CHANGED
-      );
-
       // v3: durable fibers table for runFiber
       this.sql`
         CREATE TABLE IF NOT EXISTS cf_agents_runs (
           id TEXT PRIMARY KEY NOT NULL,
           name TEXT NOT NULL,
           snapshot TEXT,
-          created_at INTEGER NOT NULL
+          created_at INTEGER NOT NULL,
+          completed_at INTEGER,
+          outcome TEXT,
+          error_message TEXT
         )
       `;
 
@@ -1888,12 +1796,26 @@ export class Agent<
       addColumnIfNotExists(
         "ALTER TABLE cf_agent_tool_runs ADD COLUMN detached_on_milestones TEXT"
       );
+      // A legacy fiber body that settled whose row delete then failed. Recovery
+      // deletes it without calling `onFiberRecovered()` (#2305).
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agents_runs ADD COLUMN completed_at INTEGER"
+      );
+      // How that settled body ended, so recovery settles a managed ledger
+      // whose own settle write failed with the body's real outcome.
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agents_runs ADD COLUMN outcome TEXT"
+      );
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agents_runs ADD COLUMN error_message TEXT"
+      );
+      // `runAgentTool({ eventDelivery: "terminal" })`: NULL means "full".
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agent_tool_runs ADD COLUMN event_delivery TEXT"
+      );
 
       // Mark schema as up-to-date
-      this.sql`
-        INSERT OR REPLACE INTO cf_agents_state (id, state)
-        VALUES (${SCHEMA_VERSION_ROW_ID}, ${String(CURRENT_SCHEMA_VERSION)})
-      `;
+      this.ctx.storage.kv.put(SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION);
     }
 
     this._schemaInitialization = {
@@ -1901,6 +1823,42 @@ export class Agent<
       currentVersion: CURRENT_SCHEMA_VERSION,
       migrated: schemaVersion < CURRENT_SCHEMA_VERSION
     };
+  }
+
+  /**
+   * Read the Agent's schema version from its KV key. A DO created before the
+   * State capability owned `cf_agents_state` has the version as a row in that
+   * table instead: read it once, move it to the key, and delete the row so the
+   * table is left with a single owner. Synchronous (`storage.kv`) because the
+   * constructor gates DDL on it.
+   */
+  private _readSchemaVersion(): number {
+    const stored = this.ctx.storage.kv.get<number>(SCHEMA_VERSION_KEY);
+    if (stored !== undefined) return stored;
+
+    const hasStateTable =
+      this.ctx.storage.sql
+        .exec(
+          "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cf_agents_state'"
+        )
+        .toArray().length > 0;
+    if (!hasStateTable) return 0;
+
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT state FROM cf_agents_state WHERE id = ?",
+        LEGACY_SCHEMA_VERSION_ROW_ID
+      )
+      .toArray() as { state: string | null }[];
+    if (rows.length === 0) return 0;
+
+    const version = Number(rows[0].state) || 0;
+    this.ctx.storage.kv.put(SCHEMA_VERSION_KEY, version);
+    this.ctx.storage.sql.exec(
+      "DELETE FROM cf_agents_state WHERE id = ?",
+      LEGACY_SCHEMA_VERSION_ROW_ID
+    );
+    return version;
   }
 
   constructor(ctx: AgentContext, env: Env) {
@@ -1971,6 +1929,31 @@ export class Agent<
         (
           method as (payload: unknown, schedule: Schedule<unknown>) => unknown
         ).call(this, payload, schedule);
+    });
+
+    this._queue = new Queue({
+      retry: this._resolvedOptions.retry,
+      onError: (error: unknown) =>
+        runInInvocation(
+          {
+            agent: this,
+            connection: undefined,
+            request: undefined,
+            email: undefined
+          },
+          () => this.onError(error)
+        )
+    });
+
+    // Agent's historical name-based queue API: names resolve to methods on
+    // this Agent, run inside the Lifecycle host boundary.
+    setQueueCallbackResolver(this._queue, (name) => {
+      const method = this[name as keyof this];
+      if (typeof method !== "function") return undefined;
+      return (payload, item) =>
+        (
+          method as (payload: unknown, item: QueueItem<unknown>) => unknown
+        ).call(this, payload, item);
     });
 
     this.tasks = new Tasks({
@@ -2049,8 +2032,10 @@ export class Agent<
     // through `this.*` so they always hit the framework-wrapped hooks.
     this.lifecycle
       .use(this.scheduler)
+      .use(this._queue)
       .use(this.mcp)
-      .use(this._webSockets, { fallback: true })
+      .use(this._state)
+      .use(this._webSockets)
       .use(this.tasks)
       // Registered for capability identity/services; its hot paths are
       // wired directly (see the DynamicAgentsInternal class doc).
@@ -2150,7 +2135,7 @@ export class Agent<
       ) {
         return;
       }
-      this._ensureConnectionWrapped(connection);
+      ensureConnectionWrapped(connection);
       return runInInvocation(
         { agent: this, connection, request: undefined, email: undefined },
         async () => {
@@ -2166,31 +2151,10 @@ export class Agent<
             return this._tryCatch(() => _onMessage(connection, message));
           }
 
-          if (isStateUpdateMessage(parsed)) {
-            // Check if connection is readonly
-            if (this.isConnectionReadonly(connection)) {
-              // Send error response back to the connection
-              connection.send(
-                JSON.stringify({
-                  type: MessageType.CF_AGENT_STATE_ERROR,
-                  error: "Connection is readonly"
-                })
-              );
-              return;
-            }
-            try {
-              this._setStateInternal(parsed.state as State, connection);
-            } catch (e) {
-              // validateStateChange (or another sync error) rejected the update.
-              // Log the full error server-side, send a generic message to the client.
-              console.error("[Agent] State update rejected:", e);
-              connection.send(
-                JSON.stringify({
-                  type: MessageType.CF_AGENT_STATE_ERROR,
-                  error: "State update rejected"
-                })
-              );
-            }
+          // State frames: readonly check, validation, error replies — all
+          // the capability's. Root sockets never reach here with one (the
+          // capability consumed it); bridged facet connections do.
+          if (this._webSockets.applyStateFrame(connection, parsed)) {
             return;
           }
 
@@ -2287,7 +2251,7 @@ export class Agent<
 
     const _onConnect = this.onConnect.bind(this);
     this.onConnect = async (connection: Connection, ctx: ConnectionContext) => {
-      this._ensureConnectionWrapped(connection);
+      ensureConnectionWrapped(connection);
       const subAgentOuterUrl = ctx.request.headers.get(
         SUB_AGENT_OUTER_URL_HEADER
       );
@@ -2324,6 +2288,18 @@ export class Agent<
           // connection. When disabled, no identity/state/MCP text frames
           // are sent — useful for binary-only clients (e.g. MQTT devices).
           if (this.shouldSendProtocolMessages(connection, ctx)) {
+            const wasExcludedFromStateInitBroadcast =
+              this._protocolBroadcastExcludeIds.has(connection.id);
+            let currentState: TState | undefined;
+            this._protocolBroadcastExcludeIds.add(connection.id);
+            try {
+              currentState = this.state;
+            } finally {
+              if (!wasExcludedFromStateInitBroadcast) {
+                this._protocolBroadcastExcludeIds.delete(connection.id);
+              }
+            }
+
             // Send agent identity first so client knows which instance it's connected to
             // Can be disabled via static options for security-sensitive instance names
             if (this._resolvedOptions.sendIdentityOnConnect) {
@@ -2354,34 +2330,14 @@ export class Agent<
                   );
                 }
               }
-              connection.send(
-                JSON.stringify({
-                  name: this.name,
-                  agent: camelCaseToKebabCase(this._ParentClass.name),
-                  type: MessageType.CF_AGENT_IDENTITY
-                })
-              );
-            }
-
-            const wasExcludedFromStateInitBroadcast =
-              this._protocolBroadcastExcludeIds.has(connection.id);
-            let currentState: State | undefined;
-            this._protocolBroadcastExcludeIds.add(connection.id);
-            try {
-              currentState = this.state;
-            } finally {
-              if (!wasExcludedFromStateInitBroadcast) {
-                this._protocolBroadcastExcludeIds.delete(connection.id);
-              }
-            }
-
-            if (currentState !== undefined) {
-              connection.send(
-                JSON.stringify({
-                  state: currentState,
-                  type: MessageType.CF_AGENT_STATE
-                })
-              );
+              // Agent's public identity: the logical name (a facet's routed
+              // name is an internal encoding of it) and the exported class.
+              this._webSockets.sendConnectFrames(connection, {
+                name: this.name,
+                agent: camelCaseToKebabCase(this._ParentClass.name)
+              });
+            } else if (currentState !== undefined) {
+              this._webSockets.sendState(connection);
             }
 
             connection.send(
@@ -2391,7 +2347,7 @@ export class Agent<
               })
             );
           } else {
-            this._setConnectionNoProtocol(connection);
+            this._webSockets.setProtocolEnabled(connection, false);
           }
 
           this._emit("connect", { connectionId: connection.id });
@@ -2607,21 +2563,17 @@ export class Agent<
     this.broadcast(msg, exclude);
   }
 
-  private _setStateInternal(
-    nextState: State,
-    source: Connection | "server" = "server"
+  /**
+   * React to a persisted state change from the State capability.
+   *
+   * Reproduces the pre-migration steps 3-4: broadcast the new state to
+   * protocol-enabled connections (excluding the originating connection) and
+   * run the notification hook off the invocation tail.
+   */
+  private _handleStateChanged(
+    nextState: TState,
+    source: Connection | "server"
   ): void {
-    // Validation/gating hook (sync only)
-    this.validateStateChange(nextState, source);
-
-    // Persist state — row existence in cf_agents_state is the signal that
-    // state was set (no separate wasChanged flag needed).
-    this._state = nextState;
-    this.sql`
-      INSERT OR REPLACE INTO cf_agents_state (id, state)
-      VALUES (${STATE_ROW_ID}, ${JSON.stringify(nextState)})
-    `;
-
     // Broadcast state to protocol-enabled connections, excluding the source
     this._broadcastProtocol(
       JSON.stringify({
@@ -2664,114 +2616,13 @@ export class Agent<
    * @param state New state to set
    * @throws Error if called from a readonly connection context
    */
-  setState(state: State): void {
+  setState(state: TState): void {
     // Check if the current context has a readonly connection
     const store = agentContext.getStore();
     if (store?.connection && this.isConnectionReadonly(store.connection)) {
       throw new Error("Connection is readonly");
     }
-    this._setStateInternal(state, "server");
-  }
-
-  /**
-   * Wraps connection.state and connection.setState so that internal
-   * _cf_-prefixed flags (readonly, no-protocol) are hidden from user code
-   * and cannot be accidentally overwritten.
-   *
-   * Idempotent — safe to call multiple times on the same connection.
-   * After hibernation, the _rawStateAccessors WeakMap is empty but the
-   * connection's state getter still reads from the persisted WebSocket
-   * attachment. Calling this method re-captures the raw getter so that
-   * predicate methods (isConnectionReadonly, isConnectionProtocolEnabled)
-   * work correctly post-hibernation.
-   */
-  private _ensureConnectionWrapped(connection: Connection) {
-    if (this._rawStateAccessors.has(connection)) return;
-
-    // Hibernating lifecycle connections expose attachment-backed state as a
-    // configurable accessor. Virtual facet connections use a data property,
-    // so retain both projections below.
-    const descriptor = Object.getOwnPropertyDescriptor(connection, "state");
-
-    let getRaw: () => Record<string, unknown> | null;
-    let setRaw: (state: unknown) => unknown;
-
-    if (descriptor?.get) {
-      // Accessor property — bind the original getter directly.
-      // The getter reads from the serialized WebSocket attachment, so it
-      // always returns the latest value even after setState updates it.
-      getRaw = descriptor.get.bind(connection) as () => Record<
-        string,
-        unknown
-      > | null;
-      setRaw = connection.setState.bind(connection);
-    } else {
-      // Data property — track raw state in a closure variable.
-      // Reading `connection.state` after our override would call our filtered
-      // getter (circular), so we snapshot the value here and keep it in sync.
-      let rawState = (connection.state ?? null) as Record<
-        string,
-        unknown
-      > | null;
-      getRaw = () => rawState;
-      setRaw = (state: unknown) => {
-        rawState = state as Record<string, unknown> | null;
-        return rawState;
-      };
-    }
-
-    this._rawStateAccessors.set(connection, { getRaw, setRaw });
-
-    // Override state getter to hide all internal _cf_ flags from user code
-    Object.defineProperty(connection, "state", {
-      configurable: true,
-      enumerable: true,
-      get() {
-        const raw = getRaw();
-        if (raw != null && typeof raw === "object" && rawHasInternalKeys(raw)) {
-          return stripInternalKeys(raw);
-        }
-        return raw;
-      }
-    });
-
-    // Override setState to preserve internal flags when user sets state
-    Object.defineProperty(connection, "setState", {
-      configurable: true,
-      writable: true,
-      value(stateOrFn: unknown | ((prev: unknown) => unknown)) {
-        const raw = getRaw();
-        const flags =
-          raw != null && typeof raw === "object"
-            ? extractInternalFlags(raw as Record<string, unknown>)
-            : {};
-        const hasFlags = Object.keys(flags).length > 0;
-
-        let newUserState: unknown;
-        if (typeof stateOrFn === "function") {
-          // Pass only the user-visible state (without internal flags) to the callback
-          const userVisible = hasFlags
-            ? stripInternalKeys(raw as Record<string, unknown>)
-            : raw;
-          newUserState = (stateOrFn as (prev: unknown) => unknown)(userVisible);
-        } else {
-          newUserState = stateOrFn;
-        }
-
-        // Merge back internal flags if any were set
-        if (hasFlags) {
-          if (newUserState != null && typeof newUserState === "object") {
-            return setRaw({
-              ...(newUserState as Record<string, unknown>),
-              ...flags
-            });
-          }
-          // User set null — store just the flags
-          return setRaw(flags);
-        }
-        return setRaw(newUserState);
-      }
-    });
+    this._state.set(state, "server");
   }
 
   /**
@@ -2780,17 +2631,7 @@ export class Agent<
    * @param readonly Whether the connection should be readonly (default: true)
    */
   setConnectionReadonly(connection: Connection, readonly = true) {
-    this._ensureConnectionWrapped(connection);
-    const accessors = this._rawStateAccessors.get(connection)!;
-    const raw = (accessors.getRaw() as Record<string, unknown> | null) ?? {};
-    if (readonly) {
-      accessors.setRaw({ ...raw, [CF_READONLY_KEY]: true });
-    } else {
-      // Remove the key entirely instead of storing false — avoids dead keys
-      // accumulating in the connection attachment.
-      const { [CF_READONLY_KEY]: _, ...rest } = raw;
-      accessors.setRaw(Object.keys(rest).length > 0 ? rest : null);
-    }
+    markConnectionReadonly(connection, readonly);
   }
 
   /**
@@ -2802,12 +2643,7 @@ export class Agent<
    * @returns True if the connection is readonly
    */
   isConnectionReadonly(connection: Connection): boolean {
-    this._ensureConnectionWrapped(connection);
-    const raw = this._rawStateAccessors.get(connection)!.getRaw() as Record<
-      string,
-      unknown
-    > | null;
-    return !!raw?.[CF_READONLY_KEY];
+    return connectionReadonly(connection);
   }
 
   /**
@@ -2823,12 +2659,7 @@ export class Agent<
    * @internal
    */
   _unsafe_getConnectionFlag(connection: Connection, key: string): unknown {
-    this._ensureConnectionWrapped(connection);
-    const raw = this._rawStateAccessors.get(connection)!.getRaw() as Record<
-      string,
-      unknown
-    > | null;
-    return raw?.[key];
+    return getConnectionFlag(connection, key);
   }
 
   /**
@@ -2836,8 +2667,8 @@ export class Agent<
    *
    * Write an internal `_cf_`-prefixed flag to the raw connection state,
    * bypassing the user-facing state wrapper. The key must be registered
-   * in `CF_INTERNAL_KEYS` so it is preserved across user `setState` calls
-   * and hidden from `connection.state`.
+   * with `registerInternalConnectionKeys` so it is preserved across user
+   * `setState` calls and hidden from `connection.state`.
    *
    * @internal
    */
@@ -2846,15 +2677,7 @@ export class Agent<
     key: string,
     value: unknown
   ): void {
-    this._ensureConnectionWrapped(connection);
-    const accessors = this._rawStateAccessors.get(connection)!;
-    const raw = (accessors.getRaw() as Record<string, unknown> | null) ?? {};
-    if (value === undefined) {
-      const { [key]: _, ...rest } = raw;
-      accessors.setRaw(Object.keys(rest).length > 0 ? rest : null);
-    } else {
-      accessors.setRaw({ ...raw, [key]: value });
-    }
+    setConnectionFlag(connection, key, value);
   }
 
   /**
@@ -2904,23 +2727,7 @@ export class Agent<
    * @returns True if the connection receives protocol messages
    */
   isConnectionProtocolEnabled(connection: Connection): boolean {
-    this._ensureConnectionWrapped(connection);
-    const raw = this._rawStateAccessors.get(connection)!.getRaw() as Record<
-      string,
-      unknown
-    > | null;
-    return !raw?.[CF_NO_PROTOCOL_KEY];
-  }
-
-  /**
-   * Mark a connection as having protocol messages disabled.
-   * Called internally when shouldSendProtocolMessages returns false.
-   */
-  private _setConnectionNoProtocol(connection: Connection) {
-    this._ensureConnectionWrapped(connection);
-    const accessors = this._rawStateAccessors.get(connection)!;
-    const raw = (accessors.getRaw() as Record<string, unknown> | null) ?? {};
-    accessors.setRaw({ ...raw, [CF_NO_PROTOCOL_KEY]: true });
+    return connectionProtocolEnabled(connection);
   }
 
   /**
@@ -2930,7 +2737,7 @@ export class Agent<
    * IMPORTANT: This hook must be synchronous.
    */
   // oxlint-disable-next-line eslint(no-unused-vars) -- params used by subclass overrides
-  validateStateChange(_nextState: State, _source: Connection | "server") {
+  validateStateChange(_nextState: TState, _source: Connection | "server") {
     // override this to validate state updates
   }
 
@@ -2943,7 +2750,7 @@ export class Agent<
    * @param source Source of the state update ("server" or a client connection)
    */
   // oxlint-disable-next-line eslint(no-unused-vars) -- params used by subclass overrides
-  onStateChanged(_state: State | undefined, _source: Connection | "server") {
+  onStateChanged(_state: TState | undefined, _source: Connection | "server") {
     // override this to handle state updates after persist + broadcast
   }
 
@@ -2959,7 +2766,7 @@ export class Agent<
    * @param source Source of the state update ("server" or a client connection)
    */
   // oxlint-disable-next-line eslint(no-unused-vars) -- params used by subclass overrides
-  onStateUpdate(_state: State | undefined, _source: Connection | "server") {
+  onStateUpdate(_state: TState | undefined, _source: Connection | "server") {
     // override this to handle state updates (deprecated — use onStateChanged)
   }
 
@@ -2968,7 +2775,7 @@ export class Agent<
    * cached in the constructor. No prototype walks at call time.
    */
   private async _callStatePersistenceHook(
-    state: State | undefined,
+    state: TState | undefined,
     source: Connection | "server"
   ): Promise<void> {
     switch (this._persistenceHookMode) {
@@ -3189,12 +2996,16 @@ export class Agent<
         proto = Object.getPrototypeOf(proto);
       }
     }
-    // Get all methods from the current instance's prototype chain
+    // The nearest descriptor for a name is authoritative: a subclass getter
+    // or field that shadows an inherited method must not be replaced by a
+    // wrapper around the inherited method.
+    const seen = new Set<string>();
     let proto = Object.getPrototypeOf(this);
-    let depth = 0;
-    while (proto && proto !== Object.prototype && depth < 10) {
+    while (proto && proto !== Agent.prototype && proto !== Object.prototype) {
       const methodNames = Object.getOwnPropertyNames(proto);
       for (const methodName of methodNames) {
+        if (seen.has(methodName)) continue;
+        seen.add(methodName);
         const descriptor = Object.getOwnPropertyDescriptor(proto, methodName);
 
         // Skip if it's a private method, a base method, a getter, or not a function,
@@ -3203,25 +3014,22 @@ export class Agent<
           methodName.startsWith("_") ||
           !descriptor ||
           !!descriptor.get ||
-          typeof descriptor.value !== "function"
+          typeof descriptor.value !== "function" ||
+          agentContextWrappers.has(descriptor.value)
         ) {
           continue;
         }
 
-        // Now, methodName is confirmed to be a custom method/function
-        // Wrap the custom method with context
+        const method = descriptor.value as Function;
         /* oxlint-disable @typescript-eslint/no-explicit-any -- dynamic method wrapping requires any */
         const wrappedFunction = withAgentContext(
-          this[methodName as keyof this] as (...args: any[]) => any
+          method as (...args: any[]) => any
         ) as any;
         /* oxlint-enable @typescript-eslint/no-explicit-any */
 
         // if the method is callable, copy the metadata from the original method
         if (this._isCallable(methodName)) {
-          copyCallableMetadata(
-            this[methodName as keyof this] as Function,
-            wrappedFunction
-          );
+          copyCallableMetadata(method, wrappedFunction);
         }
 
         // set the wrapped function on the prototype
@@ -3229,7 +3037,6 @@ export class Agent<
       }
 
       proto = Object.getPrototypeOf(proto);
-      depth++;
     }
   }
 
@@ -3296,160 +3103,54 @@ export class Agent<
   }
 
   /**
-   * Queue a task to be executed in the future
+   * Queue a task to run in the background.
+   *
+   * The item is durable: it runs from the Lifecycle alarm event loop after
+   * this call returns, in push order, one at a time, with retries per
+   * `options.retry`, and survives the Durable Object leaving memory.
    * @param callback Name of the method to call
    * @param payload Payload to pass to the callback
    * @param options Options for the queued task
    * @param options.retry Retry options for the callback execution
+   * @param options.id Stable id; a push with an existing id replaces that item
    * @returns The ID of the queued task
    */
   async queue<T = unknown>(
     callback: keyof this,
     payload: T,
-    options?: { retry?: RetryOptions }
+    options?: { retry?: RetryOptions; id?: string }
   ): Promise<string> {
-    const id = nanoid(9);
     if (typeof callback !== "string") {
       throw new Error("Callback must be a string");
     }
-
     if (typeof this[callback] !== "function") {
       throw new Error(`this.${callback} is not a function`);
     }
-
-    if (options?.retry) {
-      validateRetryOptions(options.retry, this._resolvedOptions.retry);
-    }
-
-    const retryJson = options?.retry ? JSON.stringify(options.retry) : null;
-
-    this.sql`
-      INSERT OR REPLACE INTO cf_agents_queues (id, payload, callback, retry_options)
-      VALUES (${id}, ${JSON.stringify(payload)}, ${callback}, ${retryJson})
-    `;
-
-    this._emit("queue:create", { callback: callback as string, id });
-
-    void this._flushQueue().catch((e) => {
-      console.error("Error flushing queue:", e);
-    });
-
-    return id;
-  }
-
-  private _flushingQueue = false;
-
-  private async _flushQueue() {
-    if (this._flushingQueue) {
-      return;
-    }
-    this._flushingQueue = true;
-    try {
-      while (true) {
-        const result = this.sql<QueueItem<string>>`
-        SELECT * FROM cf_agents_queues
-        ORDER BY created_at ASC
-      `;
-
-        if (!result || result.length === 0) {
-          break;
-        }
-
-        for (const row of result || []) {
-          const callback = this[row.callback as keyof Agent<Env>];
-          if (!callback) {
-            console.error(`callback ${row.callback} not found`);
-            await this.dequeue(row.id);
-            continue;
-          }
-          const { connection, request, email } = agentContext.getStore() || {};
-          await runInInvocation(
-            {
-              agent: this,
-              connection,
-              request,
-              email
-            },
-            async () => {
-              const retryOpts = parseRetryOptions(
-                row as unknown as Record<string, unknown>
-              );
-              const { maxAttempts, baseDelayMs, maxDelayMs } =
-                resolveRetryConfig(retryOpts, this._resolvedOptions.retry);
-              const parsedPayload = JSON.parse(row.payload as string);
-              try {
-                await tryN(
-                  maxAttempts,
-                  async (attempt) => {
-                    if (attempt > 1) {
-                      this._emit("queue:retry", {
-                        callback: row.callback,
-                        id: row.id,
-                        attempt,
-                        maxAttempts
-                      });
-                    }
-                    await (
-                      callback as (
-                        payload: unknown,
-                        queueItem: QueueItem<string>
-                      ) => Promise<void>
-                    ).bind(this)(parsedPayload, row);
-                  },
-                  { baseDelayMs, maxDelayMs }
-                );
-              } catch (e) {
-                console.error(
-                  `queue callback "${row.callback}" failed after ${maxAttempts} attempts`,
-                  e
-                );
-                this._emit("queue:error", {
-                  callback: row.callback,
-                  id: row.id,
-                  error: e instanceof Error ? e.message : String(e),
-                  attempts: maxAttempts
-                });
-                try {
-                  await this.onError(e);
-                } catch {
-                  // swallow onError errors
-                }
-              } finally {
-                this.dequeue(row.id);
-              }
-            },
-            // The drain loop is started with `void` and routinely outlives the
-            // handler that enqueued the item.
-            { detached: true }
-          );
-        }
-      }
-    } finally {
-      this._flushingQueue = false;
-    }
+    const item = await this._queue.push(callback, payload, options);
+    return item.id;
   }
 
   /**
    * Dequeue a task by ID
    * @param id ID of the task to dequeue
    */
-  dequeue(id: string) {
-    this.sql`DELETE FROM cf_agents_queues WHERE id = ${id}`;
+  dequeue(id: string): Promise<boolean> {
+    return this._queue.cancel(id);
   }
 
   /**
    * Dequeue all tasks
    */
-  dequeueAll() {
-    this.sql`DELETE FROM cf_agents_queues`;
+  dequeueAll(): Promise<number> {
+    return this._queue.cancelAll();
   }
 
   /**
    * Dequeue all tasks by callback
    * @param callback Name of the callback to dequeue
    */
-  dequeueAllByCallback(callback: string) {
-    this.sql`DELETE FROM cf_agents_queues WHERE callback = ${callback}`;
+  dequeueAllByCallback(callback: string): Promise<number> {
+    return this._queue.cancelAll(callback);
   }
 
   /**
@@ -3457,38 +3158,27 @@ export class Agent<
    * @param id ID of the task to get
    * @returns The task or undefined if not found
    */
-  getQueue(id: string): QueueItem<string> | undefined {
-    const result = this.sql<QueueItem<string>>`
-      SELECT * FROM cf_agents_queues WHERE id = ${id}
-    `;
-    if (!result || result.length === 0) return undefined;
-    const row = result[0];
-    return {
-      ...row,
-      payload: JSON.parse(row.payload as unknown as string),
-      retry: parseRetryOptions(row as unknown as Record<string, unknown>)
-    };
+  getQueue<T = unknown>(id: string): Promise<QueueItem<T> | undefined> {
+    return this._queue.get<T>(id);
   }
 
   /**
-   * Get all queues by key and value
+   * Get all queued tasks whose payload has `key` equal to `value`
    * @param key Key to filter by
    * @param value Value to filter by
    * @returns Array of matching QueueItem objects
    */
-  getQueues(key: string, value: string): QueueItem<string>[] {
-    const result = this.sql<QueueItem<string>>`
-      SELECT * FROM cf_agents_queues
-    `;
-    return result
-      .filter(
-        (row) => JSON.parse(row.payload as unknown as string)[key] === value
-      )
-      .map((row) => ({
-        ...row,
-        payload: JSON.parse(row.payload as unknown as string),
-        retry: parseRetryOptions(row as unknown as Record<string, unknown>)
-      }));
+  async getQueues<T = unknown>(
+    key: string,
+    value: string
+  ): Promise<QueueItem<T>[]> {
+    const items = await this._queue.list<T>();
+    return items.filter(
+      (item) =>
+        typeof item.payload === "object" &&
+        item.payload !== null &&
+        (item.payload as Record<string, unknown>)[key] === value
+    );
   }
 
   private _lifecycleRouteAddress(): LifecycleRouteAddress | undefined {
@@ -3508,11 +3198,30 @@ export class Agent<
     return this._dynamicAgents.routeLifecycleToTarget(target, envelope);
   }
 
+  /**
+   * Serves a browser's request to one of its internal hostnames. Browser
+   * Run's `InternalHostRouter` calls this over RPC; it passes the message to
+   * the `Browser` it names, which runs the host's `fetch`. Built in, so an
+   * Agent needs nothing extra for internal hostnames. Not `@callable`, so
+   * clients can't reach it.
+   */
+  async fetchInternalHost(message: InternalHostMessage): Promise<Response> {
+    await this.__unsafe_ensureInitialized();
+    // Routed by capability id rather than through the Browser itself, so
+    // Agent doesn't bundle the browser code.
+    return (await this.lifecycle.route({
+      capability: browserCapabilityId(message.browser),
+      source: undefined,
+      payload: message
+    })) as Response;
+  }
+
   /** Single native-RPC aperture for routed Lifecycle capabilities. */
-  _cf_routeLifecycle(
+  async _cf_routeLifecycle(
     target: LifecycleRouteAddress | undefined,
     envelope: LifecycleRouteEnvelope
   ): Promise<unknown> {
+    await this.__unsafe_ensureInitialized();
     return this._dynamicAgents.routeLifecycle(target, envelope);
   }
 
@@ -3535,6 +3244,7 @@ export class Agent<
   async _cf_cleanupFacetPrefix(
     ownerPath: ReadonlyArray<AgentPathStep>
   ): Promise<void> {
+    await this.__unsafe_ensureInitialized();
     await this._dynamicAgents.cleanupPrefix(ownerPath);
   }
 
@@ -3544,9 +3254,10 @@ export class Agent<
    * physical alarm, so this lets facet work use the root alarm heartbeat.
    * @internal
    */
-  _cf_acquireFacetKeepAlive(
+  async _cf_acquireFacetKeepAlive(
     ownerPath: ReadonlyArray<AgentPathStep>
   ): Promise<string> {
+    await this.__unsafe_ensureInitialized();
     return this._dynamicAgents.acquireKeepAlive(ownerPath);
   }
 
@@ -3555,8 +3266,9 @@ export class Agent<
    * Idempotent so disposer calls can safely race or run twice.
    * @internal
    */
-  _cf_releaseFacetKeepAlive(token: string): Promise<void> {
-    return this._dynamicAgents.releaseKeepAlive(token);
+  async _cf_releaseFacetKeepAlive(token: string): Promise<void> {
+    await this.__unsafe_ensureInitialized();
+    await this._dynamicAgents.releaseKeepAlive(token);
   }
 
   /**
@@ -3565,22 +3277,24 @@ export class Agent<
    * The facet remains authoritative for snapshots and recovery hooks.
    * @internal
    */
-  _cf_registerFacetRun(
+  async _cf_registerFacetRun(
     ownerPath: ReadonlyArray<AgentPathStep>,
     runId: string
   ): Promise<void> {
-    return this._dynamicAgents.registerRun(ownerPath, runId);
+    await this.__unsafe_ensureInitialized();
+    await this._dynamicAgents.registerRun(ownerPath, runId);
   }
 
   /**
    * Remove a completed facet fiber from the root-side index.
    * @internal
    */
-  _cf_unregisterFacetRun(
+  async _cf_unregisterFacetRun(
     ownerPath: ReadonlyArray<AgentPathStep>,
     runId: string
   ): Promise<void> {
-    return this._dynamicAgents.unregisterRun(ownerPath, runId);
+    await this.__unsafe_ensureInitialized();
+    await this._dynamicAgents.unregisterRun(ownerPath, runId);
   }
 
   /**
@@ -4615,6 +4329,9 @@ export class Agent<
 
     let root: RootFacetRpcSurface | undefined;
     let registeredFacetRun = false;
+    let bodyOutcome:
+      | { status: "completed" | "error" | "aborted"; error: string | null }
+      | undefined;
     let dispose: () => void = () => {};
     try {
       if ("initialSnapshot" in (options ?? {})) {
@@ -4633,9 +4350,19 @@ export class Agent<
       };
 
       try {
-        const result = await _fiberALS.run({ id, signal, stash }, () =>
-          fn({ id, signal, stash, snapshot: null })
-        );
+        let result: T;
+        try {
+          result = await _fiberALS.run({ id, signal, stash }, () =>
+            fn({ id, signal, stash, snapshot: null })
+          );
+        } catch (error) {
+          bodyOutcome = {
+            status: signal.aborted ? "aborted" : "error",
+            error: this._fiberErrorMessage(error)
+          };
+          throw error;
+        }
+        bodyOutcome = { status: "completed", error: null };
         options?.beforeRunCleanup?.({ ok: true });
         this._emit("fiber:run:completed", {
           fiberId: id,
@@ -4657,19 +4384,43 @@ export class Agent<
       }
     } finally {
       this._runFiberActiveFibers.delete(id);
-      this._withAgentSpan(
-        "finalize_fiber",
-        "fiber",
-        {
-          "cloudflare.agents.fiber.id": id,
-          "cloudflare.agents.fiber.name": name
-        },
-        () => {
-          this.sql`DELETE FROM cf_agents_runs WHERE id = ${id}`;
-        }
-      );
+      let rowDeleted = false;
+      try {
+        this._withAgentSpan(
+          "finalize_fiber",
+          "fiber",
+          {
+            "cloudflare.agents.fiber.id": id,
+            "cloudflare.agents.fiber.name": name
+          },
+          () => {
+            if (bodyOutcome) {
+              try {
+                this.sql`
+                  UPDATE cf_agents_runs
+                  SET completed_at = ${Date.now()},
+                      outcome = ${bodyOutcome.status},
+                      error_message = ${bodyOutcome.error}
+                  WHERE id = ${id}
+                `;
+              } catch {
+                // The delete below is still worth attempting.
+              }
+            }
+            this.sql`DELETE FROM cf_agents_runs WHERE id = ${id}`;
+          }
+        );
+        rowDeleted = true;
+      } catch (error) {
+        console.error(
+          `[Agent] Failed to finalize fiber "${name}" (${id}); leaving run row for recovery:`,
+          error
+        );
+      }
       dispose();
-      if (root && registeredFacetRun) {
+      // The root's registration is what brings recovery back to an idle facet,
+      // so it stays until the leftover row is gone.
+      if (root && registeredFacetRun && rowDeleted) {
         try {
           await root._cf_unregisterFacetRun(this.selfPath, id);
         } catch (e) {
@@ -4763,7 +4514,14 @@ export class Agent<
         name: string;
         snapshot: string | null;
         created_at: number;
-      }>`SELECT id, name, snapshot, created_at FROM cf_agents_runs`;
+        completed_at: number | null;
+        outcome: "completed" | "error" | "aborted" | null;
+        error_message: string | null;
+      }>`
+        SELECT id, name, snapshot, created_at, completed_at, outcome,
+               error_message
+        FROM cf_agents_runs
+      `;
 
       for (const row of rows) {
         if (scanDeadlineMs > 0 && Date.now() - scanStartedAt > scanDeadlineMs) {
@@ -4777,6 +4535,38 @@ export class Agent<
         }
         if (this._runFiberActiveFibers.has(row.id)) continue;
 
+        const managedRow = this._readFiber(row.id);
+        // A managed row needs the recorded outcome; without it the ledger
+        // can't be settled truthfully, so it falls through to recovery.
+        if (
+          row.completed_at !== null &&
+          (!managedRow || row.outcome !== null)
+        ) {
+          // The body settled and only its cleanup failed: nothing to recover.
+          // A managed ledger still non-terminal here means its settle write
+          // failed too, so record the body's own outcome.
+          if (managedRow) {
+            this.sql`
+              UPDATE cf_agents_fibers
+              SET status = ${row.outcome},
+                  error_message = ${row.error_message},
+                  completed_at = ${row.completed_at}
+              WHERE fiber_id = ${row.id}
+                AND status IN ('pending', 'running')
+            `;
+          }
+          this.sql`DELETE FROM cf_agents_runs WHERE id = ${row.id}`;
+          madeProgress = true;
+          if (managedRow) this._notifyManagedFiberTerminal(row.id);
+          continue;
+        }
+        if (managedRow && this._isTerminalFiberStatus(managedRow.status)) {
+          this.sql`DELETE FROM cf_agents_runs WHERE id = ${row.id}`;
+          madeProgress = true;
+          this._notifyManagedFiberTerminal(row.id);
+          continue;
+        }
+
         const snapshot = this._parseFiberRecoverySnapshot(row.id, row.snapshot);
         const ctx: FiberRecoveryContext = {
           id: row.id,
@@ -4786,7 +4576,6 @@ export class Agent<
           recoveryReason: "interrupted"
         };
 
-        const managedRow = this._readFiber(row.id);
         this._emit("fiber:recovery:detected", {
           ...this._fiberRecoveryPayload(ctx, managedRow),
           elapsedMs: Date.now() - row.created_at
@@ -4799,13 +4588,6 @@ export class Agent<
           elapsedMs: Date.now() - row.created_at
         });
         if (managedRow) {
-          if (this._isTerminalFiberStatus(managedRow.status)) {
-            this.sql`DELETE FROM cf_agents_runs WHERE id = ${row.id}`;
-            madeProgress = true;
-            this._notifyManagedFiberTerminal(row.id);
-            continue;
-          }
-
           const completedAt = Date.now();
           this.sql`
             UPDATE cf_agents_fibers
@@ -4992,10 +4774,11 @@ export class Agent<
    * cleanup as `parent.deleteSubAgent(Cls, name)` from the parent.
    * @internal
    */
-  _cf_destroyDescendantFacet(
+  async _cf_destroyDescendantFacet(
     targetPath: ReadonlyArray<AgentPathStep>
   ): Promise<void> {
-    return this._dynamicAgents.destroyDescendant(targetPath);
+    await this.__unsafe_ensureInitialized();
+    await this._dynamicAgents.destroyDescendant(targetPath);
   }
 
   /**
@@ -5039,6 +4822,21 @@ export class Agent<
    */
   private async _syncHostJobs(): Promise<void> {
     if (this._destroyed) return;
+    if (this._isFacet) {
+      // A facet has no alarm slot (`setAlarm()` throws): the root holds its
+      // keepAlive refs and facet-run leases, and facets never write the
+      // destroy marker. Earlier releases could persist a host job here
+      // before the re-arm threw; drop it so it cannot re-arm again.
+      const work = this.lifecycle.jobs;
+      for (const id of [
+        HOST_JOB_DESTROY_ID,
+        HOST_JOB_KEEP_ALIVE_ID,
+        HOST_JOB_HOUSEKEEPING_ID
+      ]) {
+        if (work.get(id)) await work.cancel(id);
+      }
+      return;
+    }
     await this._withAgentSpan("schedule_agent_alarm", "alarm", {}, async () => {
       const work = this.lifecycle.jobs;
       const nowMs = Date.now();
@@ -5248,10 +5046,16 @@ export class Agent<
       className: match.childClass,
       name: match.childName
     });
-    if (decision instanceof Response) return decision;
+    const isWebSocketUpgrade =
+      request.headers.get("Upgrade")?.toLowerCase() === "websocket";
+    if (decision instanceof Response) {
+      return isWebSocketUpgrade && !decision.webSocket
+        ? rejectSubAgentWebSocket(decision)
+        : decision;
+    }
     const forwardReq = decision instanceof Request ? decision : request;
 
-    if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+    if (isWebSocketUpgrade) {
       const acceptHeaders = new Headers(forwardReq.headers);
       const routedUrl = new URL(forwardReq.url);
       routedUrl.pathname = new URL(request.url).pathname;
@@ -5329,34 +5133,48 @@ export class Agent<
     message: string | ArrayBuffer | ArrayBufferView,
     without?: string[]
   ): Promise<void> {
+    await this.__unsafe_ensureInitialized();
     await this._dynamicAgents.broadcastToPath(ownerPath, message, without);
   }
 
-  _cf_subAgentConnectionMetas(
+  async _cf_subAgentConnectionMetas(
     ownerPath: ReadonlyArray<AgentPathStep>
   ): Promise<SubAgentConnectionMeta[]> {
+    await this.__unsafe_ensureInitialized();
     return this._dynamicAgents.connectionMetas(ownerPath);
   }
 
-  _cf_sendToSubAgentConnection(
+  async _cf_sendToSubAgentConnection(
     connectionId: string,
     message: string | ArrayBuffer | ArrayBufferView
   ): Promise<void> {
-    return this._dynamicAgents.sendToConnection(connectionId, message);
+    await this.__unsafe_ensureInitialized();
+    await this._dynamicAgents.sendToConnection(connectionId, message);
   }
 
-  _cf_closeSubAgentConnection(
+  async _cf_closeSubAgentConnection(
     connectionId: string,
     code?: number,
     reason?: string
   ): Promise<void> {
-    return this._dynamicAgents.closeConnection(connectionId, code, reason);
+    await this.__unsafe_ensureInitialized();
+    await this._dynamicAgents.closeConnection(connectionId, code, reason);
   }
 
-  _cf_setSubAgentConnectionState(
+  async _cf_closeSubAgentConnectionsForPrefix(
+    prefix: ReadonlyArray<AgentPathStep>,
+    code: number,
+    reason: string
+  ): Promise<void> {
+    await this.__unsafe_ensureInitialized();
+    this._dynamicAgents.closeConnectionsForPrefix(prefix, code, reason);
+  }
+
+  async _cf_setSubAgentConnectionState(
     connectionId: string,
     state: unknown
   ): Promise<unknown> {
+    await this.__unsafe_ensureInitialized();
     return this._dynamicAgents.setConnectionState(connectionId, state);
   }
 
@@ -5899,6 +5717,17 @@ export class Agent<
     const runId = options.runId ?? nanoid(12);
     const agentType = cls.name;
     const detached = this._parseDetachedOption(options.detached);
+    const eventDelivery = options.eventDelivery ?? "full";
+    if (eventDelivery !== "full" && eventDelivery !== "terminal") {
+      throw new Error(
+        `runAgentTool: eventDelivery must be "full" or "terminal", got ${JSON.stringify(eventDelivery)}.`
+      );
+    }
+    if (detached && eventDelivery === "terminal") {
+      throw new Error(
+        'runAgentTool: eventDelivery "terminal" is not supported for detached runs.'
+      );
+    }
 
     const existing = this._readAgentToolRun(runId);
     if (existing) {
@@ -6050,13 +5879,14 @@ export class Agent<
         input_redacted, status, display_metadata, display_order, started_at,
         detached, detached_on_finish, detached_notify_source,
         detached_max_budget_at, detached_no_progress_budget_ms,
-        detached_on_milestones
+        detached_on_milestones, event_delivery
       ) VALUES (
         ${runId}, ${options.parentToolCallId ?? null}, ${agentType},
         ${inputPreviewJson}, 1, 'starting', ${displayJson}, ${displayOrder},
         ${startedAt}, ${detached ? 1 : 0}, ${detached?.onFinishName ?? null},
         ${detached?.notifySource ?? null}, ${detachedMaxBudgetAt},
-        ${detachedNoProgressBudgetMs}, ${detachedOnMilestonesJson}
+        ${detachedNoProgressBudgetMs}, ${detachedOnMilestonesJson},
+        ${eventDelivery === "terminal" ? "terminal" : null}
       )
     `;
 
@@ -6086,7 +5916,8 @@ export class Agent<
     const child = await this.subAgent(cls as SubAgentClass<Agent>, runId);
     const adapter = this._asAgentToolChildAdapter<Input, Output>(child);
     const childStart = await adapter.startAgentToolRun(options.input, {
-      runId
+      runId,
+      ...(eventDelivery === "terminal" ? { eventDelivery } : {})
     });
     this._markAgentToolRunning(runId);
 
@@ -7146,17 +6977,30 @@ export class Agent<
     replay?: true,
     connection?: Connection
   ): number {
+    const terminalOnly = this._isTerminalOnlyAgentToolRun(runId);
     let next = sequence;
     for (const chunk of chunks) {
+      // Stored chunks are numbered by store position (`started` is 0, stored
+      // chunk i is i + 1) on both the live and replay paths, so they dedupe
+      // against each other. A skipped chunk still takes its sequence.
+      const chunkSequence = next++;
+      if (terminalOnly && !isAgentToolLifecycleChunk(chunk.body)) continue;
       this._broadcastAgentToolEvent(
         parentToolCallId,
-        next++,
+        chunkSequence,
         { kind: "chunk", runId, body: chunk.body },
         replay,
         connection
       );
     }
     return next;
+  }
+
+  private _isTerminalOnlyAgentToolRun(runId: string): boolean {
+    const rows = this.sql<{ event_delivery: string | null }>`
+      SELECT event_delivery FROM cf_agent_tool_runs WHERE run_id = ${runId}
+    `;
+    return rows[0]?.event_delivery === "terminal";
   }
 
   private async _broadcastAgentToolStoredChunks(
@@ -7166,17 +7010,38 @@ export class Agent<
     >,
     sequence: number,
     replay?: true,
-    connection?: Connection
+    connection?: Connection,
+    timeoutMs?: number
   ): Promise<number> {
-    const child = await this._cf_resolveSubAgent(row.agent_type, row.run_id);
+    const deadline = this._agentToolRecoveryDeadline(timeoutMs);
+    const resolving = this._cf_resolveSubAgent(row.agent_type, row.run_id);
+    const child =
+      deadline === undefined
+        ? await resolving
+        : await this._settleWithinRecoveryTimeout(resolving, deadline());
+    if (child === undefined) return sequence;
     const adapter = this._asAgentToolChildAdapter(child);
     return this._broadcastAgentToolStoredChunksFromAdapter(
       adapter,
       row,
       sequence,
       replay,
-      connection
+      connection,
+      deadline?.()
     );
+  }
+
+  /**
+   * One budget shared by every step of a bounded recovery read, so a run's
+   * total time stays within `timeoutMs`. Returns the remaining milliseconds,
+   * never below 1 because a non-positive timeout means "unbounded".
+   */
+  private _agentToolRecoveryDeadline(
+    timeoutMs?: number
+  ): (() => number) | undefined {
+    if (timeoutMs === undefined || timeoutMs <= 0) return undefined;
+    const deadline = Date.now() + timeoutMs;
+    return () => Math.max(1, deadline - Date.now());
   }
 
   private async _broadcastAgentToolStoredChunksFromAdapter(
@@ -7187,20 +7052,75 @@ export class Agent<
     connection?: Connection,
     timeoutMs?: number
   ): Promise<number> {
+    const deadline = this._agentToolRecoveryDeadline(timeoutMs);
     const chunks = await this._getAgentToolChunksForRecovery(
       adapter,
       row.run_id,
+      deadline?.()
+    );
+    const next = chunks
+      ? this._broadcastAgentToolChunks(
+          row.parent_tool_call_id ?? undefined,
+          row.run_id,
+          chunks,
+          sequence,
+          replay,
+          connection
+        )
+      : sequence;
+    return this._broadcastAgentToolMilestones(
+      adapter,
+      row,
+      next,
+      replay,
+      connection,
+      deadline?.()
+    );
+  }
+
+  /**
+   * Milestones are persisted on the child run rather than in its chunk log, so
+   * replay re-emits them from the child's inspection. The client dedupes them
+   * on the milestone's own sequence, so a milestone already seen live is a no-op.
+   * They carry the next stored-chunk sequence without consuming it, matching
+   * the live path.
+   */
+  private async _broadcastAgentToolMilestones(
+    adapter: AgentToolChildAdapter,
+    row: Pick<AgentToolRunStorageRow, "run_id" | "parent_tool_call_id">,
+    sequence: number,
+    replay?: true,
+    connection?: Connection,
+    timeoutMs?: number
+  ): Promise<number> {
+    // Read-only: replaying milestones must never seal a stale child run.
+    const inspection = await this._settleWithinRecoveryTimeout(
+      adapter.inspectAgentToolRun(row.run_id, { reconcile: false }),
       timeoutMs
     );
-    if (!chunks) return sequence;
-    return this._broadcastAgentToolChunks(
-      row.parent_tool_call_id ?? undefined,
-      row.run_id,
-      chunks,
-      sequence,
-      replay,
-      connection
-    );
+    const milestones: AgentToolMilestone[] = inspection?.milestones ?? [];
+    for (const milestone of milestones) {
+      this._broadcastAgentToolEvent(
+        row.parent_tool_call_id ?? undefined,
+        sequence,
+        {
+          kind: "chunk",
+          runId: row.run_id,
+          body: JSON.stringify({
+            type: AGENT_TOOL_MILESTONE_PART,
+            data: {
+              name: milestone.name,
+              sequence: milestone.sequence,
+              at: milestone.at,
+              ...(milestone.data !== undefined ? { data: milestone.data } : {})
+            }
+          })
+        },
+        replay,
+        connection
+      );
+    }
+    return sequence;
   }
 
   private async _forwardAgentToolStream(
@@ -7210,9 +7130,14 @@ export class Agent<
     sequence: number,
     signal?: AbortSignal,
     idleTimeoutMs?: number
-  ): Promise<{ next: number; ended: "done" | "idle" | "aborted" }> {
+  ): Promise<{
+    next: number;
+    ended: "done" | "idle" | "aborted";
+    forwarded: boolean;
+  }> {
     let next = sequence;
-    if (signal?.aborted) return { next, ended: "aborted" };
+    let forwarded = false;
+    if (signal?.aborted) return { next, ended: "aborted", forwarded };
     // How the forward loop ended, so the re-attach caller can re-arm ONLY on a
     // clean stream-close (`done`) and never abandon a fresh reader per idle
     // cycle: `idle` = a full no-progress window elapsed (stalled), `aborted` =
@@ -7260,13 +7185,27 @@ export class Agent<
     // produces output (a silent/hung child forwards nothing → no credit → the
     // parent still exhausts on its own no-progress timer).
     let forwardedSinceProgress = false;
+    const terminalOnly = this._isTerminalOnlyAgentToolRun(runId);
     try {
       const forwardChunk = (chunk: AgentToolStoredChunk) => {
-        this._broadcastAgentToolEvent(parentToolCallId, next++, {
-          kind: "chunk",
-          runId,
-          body: chunk.body
-        });
+        // Progress/milestone frames and chunks too large to store are
+        // broadcast-only on the child and never replayed from its store, so
+        // they must not consume a stored-chunk sequence or live and replayed
+        // numbering drift apart (#2364).
+        const lifecycle = isAgentToolLifecycleChunk(chunk.body);
+        const unstoredId =
+          typeof chunk.unstoredId === "string" ? chunk.unstoredId : undefined;
+        const chunkSequence =
+          lifecycle || unstoredId !== undefined ? next : next++;
+        forwarded = true;
+        if (!terminalOnly || lifecycle) {
+          this._broadcastAgentToolEvent(parentToolCallId, chunkSequence, {
+            kind: "chunk",
+            runId,
+            body: chunk.body,
+            ...(unstoredId !== undefined ? { unstoredId } : {})
+          });
+        }
         // A reserved `data-agent-progress` frame fires the parent `onProgress`
         // hook + refreshes the cached liveness timestamp. Best-effort: never
         // let a progress observation break the forward loop.
@@ -7373,7 +7312,7 @@ export class Agent<
       // The re-attach loop re-arms only on `ended === "done"`, so at most ONE
       // such read is ever left pending per re-attach (no per-cycle leak).
     }
-    return { next, ended };
+    return { next, ended, forwarded };
   }
 
   /**
@@ -7707,9 +7646,9 @@ export class Agent<
    * dies and recovers again during deploy churn is still collected. A genuinely
    * silent/hung child can never block recovery forever: it seals `interrupted`
    * after one `noProgressTimeoutMs` window. `maxWindowMs` is an OPTIONAL hard
-   * wall-clock ceiling (default `Infinity` — uncapped, mirroring #1672's
-   * `maxRecoveryWork`); set it finite to also bound a child that keeps
-   * progressing, which seals `window-exceeded` and tears the child down.
+   * wall-clock ceiling (default `Infinity` — uncapped, #1672); set it finite
+   * to also bound a child that keeps progressing, which seals
+   * `window-exceeded` and tears the child down.
    *
    * Returns the terminal `result` (and `completedAt`) when the child reaches a
    * terminal status, plus the advanced broadcast `sequence`. Returns
@@ -7821,18 +7760,23 @@ export class Agent<
         // reducer appends by arrival order). Forwarding only chunks produced
         // after this point keeps the live stream correct without dupes.
         let afterSequence = -1;
+        // Tailed chunks continue the stored-position numbering replay uses, so
+        // clients that already saw the stored chunks don't dedupe new ones away.
+        let storedCount = 0;
         try {
           const existing = await adapter.getAgentToolChunks(row.run_id);
           const last = existing[existing.length - 1];
           if (last) afterSequence = last.sequence;
+          storedCount = existing.length;
         } catch {
           // Fall back to a full tail if the chunk probe fails.
         }
+        nextSequence = storedCount + 1;
 
-        const beforeSequence = nextSequence;
         // Defaults to a non-`done` end so a tail that throws below does NOT
         // re-arm (we only re-arm on a verified clean stream-close).
         let streamEnded: "done" | "idle" | "aborted" = "idle";
+        let forwardedAny = false;
         try {
           // NOTE: the ceiling signal is NOT forwarded to `tailAgentToolRun` — an
           // AbortSignal can't be serialized across the child-facet DO RPC. We
@@ -7856,6 +7800,7 @@ export class Agent<
           );
           nextSequence = forwarded.next;
           streamEnded = forwarded.ended;
+          forwardedAny = forwarded.forwarded;
         } catch {
           // Tail failures fall through to an inspect; the child remains
           // authoritative for terminal status and durable chunk replay.
@@ -7877,7 +7822,7 @@ export class Agent<
         // abandon a fresh pending reader every cycle. No progress likewise
         // seals.
         if (streamEnded !== "done") break;
-        if (nextSequence <= beforeSequence) break;
+        if (!forwardedAny) break;
       }
     } finally {
       if (ceilingTimer !== undefined) clearTimeout(ceilingTimer);
@@ -7929,11 +7874,14 @@ export class Agent<
       );
 
       try {
+        // Bounded end to end (child resolution included) so one unresponsive
+        // child can't stall onConnect or every later run's replay.
         sequence = await this._broadcastAgentToolStoredChunks(
           row,
           sequence,
           true,
-          connection
+          connection,
+          DEFAULT_AGENT_TOOL_RECOVERY_TIMEOUT_MS
         );
       } catch {
         // Keep replay best-effort per run.
@@ -8298,14 +8246,25 @@ export class Agent<
     runId: string,
     timeoutMs?: number
   ): Promise<AgentToolStoredChunk[] | undefined> {
-    const chunks = adapter.getAgentToolChunks(runId).catch(() => undefined);
-    if (timeoutMs === undefined || timeoutMs <= 0) return chunks;
+    return this._settleWithinRecoveryTimeout(
+      adapter.getAgentToolChunks(runId),
+      timeoutMs
+    );
+  }
+
+  /** Resolve to `undefined` when `promise` rejects or outlasts `timeoutMs`. */
+  private async _settleWithinRecoveryTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs?: number
+  ): Promise<T | undefined> {
+    const settled = promise.catch(() => undefined);
+    if (timeoutMs === undefined || timeoutMs <= 0) return settled;
 
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<undefined>((resolve) => {
       timeoutId = setTimeout(() => resolve(undefined), timeoutMs);
     });
-    const result = await Promise.race([chunks, timeout]);
+    const result = await Promise.race([settled, timeout]);
     if (timeoutId !== undefined) clearTimeout(timeoutId);
     return result;
   }
@@ -9486,7 +9445,7 @@ export class Agent<
   }
 
   private _findBindingNameForNamespace(
-    namespace: DurableObjectNamespace<McpAgent>
+    namespace: DurableObjectNamespace<McpRpcAgent>
   ): string | undefined {
     for (const [key, value] of Object.entries(
       this.env as Record<string, unknown>
@@ -9680,13 +9639,13 @@ export class Agent<
   ): Promise<void> {
     await this.__unsafe_ensureInitialized();
     if (action === "set") {
-      this.setState(state as State);
+      this.setState(state as TState);
     } else if (action === "merge") {
-      const currentState = this.state ?? ({} as State);
+      const currentState = this.state ?? ({} as TState);
       this.setState({
         ...currentState,
         ...(state as Record<string, unknown>)
-      } as State);
+      } as TState);
     } else if (action === "reset") {
       this.setState(this.initialState);
     }
@@ -9702,7 +9661,7 @@ export class Agent<
    * await this.addMcpServer("counter", env.MY_MCP);
    * await this.addMcpServer("counter", env.MY_MCP, { props: { userId: "123" } });
    */
-  async addMcpServer<T extends McpAgent>(
+  async addMcpServer<T extends McpRpcAgent>(
     serverName: string,
     binding: DurableObjectNamespace<T>,
     options?: AddRpcMcpServerOptions
@@ -9731,7 +9690,7 @@ export class Agent<
     | { id: string; state: typeof MCPConnectionState.READY }
   >;
 
-  async addMcpServer<T extends McpAgent>(
+  async addMcpServer<T extends McpRpcAgent>(
     serverName: string,
     urlOrBinding: string | DurableObjectNamespace<T>,
     callbackHostOrOptions?:
@@ -9893,7 +9852,7 @@ export class Agent<
           transport: {
             type: "rpc" as TransportType,
             namespace:
-              urlOrBinding as unknown as DurableObjectNamespace<McpAgent>,
+              urlOrBinding as unknown as DurableObjectNamespace<McpRpcAgent>,
             name: normalizedName,
             props: rpcOpts?.props
           }
@@ -9915,7 +9874,7 @@ export class Agent<
       }
 
       const bindingName = this._findBindingNameForNamespace(
-        urlOrBinding as unknown as DurableObjectNamespace<McpAgent>
+        urlOrBinding as unknown as DurableObjectNamespace<McpRpcAgent>
       );
       if (bindingName) {
         this.mcp.saveRpcServerToStorage(

@@ -1,0 +1,245 @@
+import { useState } from "react";
+import { Button, Surface, Text } from "@cloudflare/kumo";
+import { DemoWrapper } from "../../layout";
+import { CodeExplanation, LogPanel, type CodeSection } from "../../components";
+import { useLogs } from "../../hooks";
+
+type LayerId = "think" | "workspace" | "exec" | "git" | "extensions";
+
+const layers: Array<{
+  id: LayerId;
+  name: string;
+  role: string;
+  details: string[];
+}> = [
+  {
+    id: "think",
+    name: "Think",
+    role: "Opinionated chat loop",
+    details: [
+      "Owns the AI SDK streamText call",
+      "Persists messages in Durable Object SQLite",
+      "Supports client tools, resumable streams, and lifecycle hooks"
+    ]
+  },
+  {
+    id: "workspace",
+    name: "Computer Workspace",
+    role: "Durable virtual filesystem",
+    details: [
+      "Stores files in the agent's own SQLite",
+      "Gives the model read, ls, find, grep, write, edit, and delete tools",
+      "Survives refreshes and follow-up turns"
+    ]
+  },
+  {
+    id: "exec",
+    name: "Execution backends",
+    role: "Run code against the same files",
+    details: [
+      "JavaScript modules or just-bash in a Dynamic Worker, or a full Linux container",
+      "The exec tool appears once the Workspace has a backend",
+      "Modules you supply, such as ws:git, are importable from executed code"
+    ]
+  },
+  {
+    id: "git",
+    name: "Git",
+    role: "Version control over virtual files",
+    details: [
+      "Uses isomorphic-git against the Workspace filesystem",
+      "Runs in the host, so executed code needs no network of its own",
+      "Available as workspace.git and as the ws:git module"
+    ]
+  },
+  {
+    id: "extensions",
+    name: "Extensions",
+    role: "Loadable assistant capabilities",
+    details: [
+      "Think can load extension manifests",
+      "Extensions can provide tools and hook subscriptions",
+      "Worker Loader can isolate extension code"
+    ]
+  }
+];
+
+const flow = [
+  [
+    "user_message",
+    { text: "Rename foo to bar across /workspace/src and summarize changes" }
+  ],
+  ["think_before_turn", { contextBlocks: ["workspace tree", "recent files"] }],
+  ["tool_grep", { pattern: "foo", path: "/workspace/src", matches: 3 }],
+  ["tool_exec", { backend: "js", source: "export default async () => ..." }],
+  ["tool_exec_result", { exitCode: 0, filesChanged: 2 }],
+  ["assistant_response", { summary: "Renamed foo to bar in two files." }]
+];
+
+const codeSections: CodeSection[] = [
+  {
+    title: "Use Think when you want a full assistant",
+    description:
+      "Think is the high-level agent base class: chat protocol, persistence, stream resumption, client tools, workspace tools, and lifecycle hooks.",
+    code: `import { Think } from "@cloudflare/think";
+
+export class Assistant extends Think<Env> {
+  getModel() {
+    return "@cf/moonshotai/kimi-k2.7-code";
+  }
+
+  getSystemPrompt() {
+    return "You are a helpful coding assistant.";
+  }
+}`
+  },
+  {
+    title: "Give the assistant a Workspace that can run code",
+    description:
+      "Every Think agent has a Computer Workspace with file tools. Add an execution backend, and the modules it offers, to give the model an exec tool.",
+    code: `import { Workspace } from "@cloudflare/computer";
+import { WorkerJavaScriptBackend } from "@cloudflare/computer/backends/worker-javascript";
+import { createGitClient } from "@cloudflare/computer/git";
+import { createGitModule } from "@cloudflare/computer/modules/git";
+
+export class Assistant extends Think<Env> {
+  override workspace = new Workspace({
+    storage: this.ctx.storage,
+    git: createGitClient(),
+    backends: [
+      new WorkerJavaScriptBackend({
+        id: "js",
+        loader: this.env.LOADER,
+        access: "read-write",
+        modules: { "ws:git": createGitModule() }
+      })
+    ]
+  });
+}`
+  }
+];
+
+export function ThinkComputerDemo() {
+  const [selectedId, setSelectedId] = useState<LayerId>("think");
+  const { logs, addLog, clearLogs } = useLogs();
+  const selected = layers.find((layer) => layer.id === selectedId) ?? layers[0];
+
+  const simulate = () => {
+    clearLogs();
+    flow.forEach(([type, payload], index) => {
+      window.setTimeout(
+        () => addLog("in", type as string, payload),
+        index * 300
+      );
+    });
+  };
+
+  return (
+    <DemoWrapper
+      title="Think + Computer"
+      description={
+        <>
+          Think is the higher-level assistant runtime; a Computer Workspace
+          gives that assistant durable files and code execution against them.
+          Together they are the SDK path for coding assistants, workspace
+          agents, and multi-step tool-using products.
+        </>
+      }
+    >
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="space-y-6">
+          <Surface className="p-4 rounded-lg ring ring-kumo-line">
+            <div className="mb-4">
+              <Text variant="heading3" as="h3">
+                Assistant Stack
+              </Text>
+            </div>
+            <div className="space-y-2">
+              {layers.map((layer) => (
+                <button
+                  key={layer.id}
+                  type="button"
+                  onClick={() => setSelectedId(layer.id)}
+                  className={`w-full text-left p-3 rounded border transition-colors ${
+                    selectedId === layer.id
+                      ? "border-kumo-brand bg-kumo-elevated"
+                      : "border-kumo-line hover:border-kumo-interact"
+                  }`}
+                >
+                  <Text bold size="sm">
+                    {layer.name}
+                  </Text>
+                  <p className="mt-1 text-xs text-kumo-subtle">{layer.role}</p>
+                </button>
+              ))}
+            </div>
+          </Surface>
+
+          <Surface className="p-4 rounded-lg ring ring-kumo-line">
+            <div className="mb-4">
+              <Text variant="heading3" as="h3">
+                {selected.name}
+              </Text>
+            </div>
+            <p className="text-sm text-kumo-subtle mb-4">{selected.role}</p>
+            <div className="space-y-2">
+              {selected.details.map((detail) => (
+                <div key={detail} className="p-3 rounded bg-kumo-elevated">
+                  <Text size="sm">{detail}</Text>
+                </div>
+              ))}
+            </div>
+          </Surface>
+        </div>
+
+        <div className="space-y-6">
+          <Surface className="p-4 rounded-lg ring ring-kumo-line">
+            <div className="mb-4">
+              <Text variant="heading3" as="h3">
+                Simulated Workspace Turn
+              </Text>
+            </div>
+            <p className="text-sm text-kumo-subtle mb-4">
+              This is the kind of turn Think + Computer is designed for: gather
+              context, operate on durable files, run code against them, then
+              return a diff-aware answer.
+            </p>
+            <Button variant="primary" onClick={simulate}>
+              Simulate Workspace Turn
+            </Button>
+          </Surface>
+
+          <LogPanel logs={logs} onClear={clearLogs} maxHeight="280px" />
+
+          <Surface className="p-4 rounded-lg ring ring-kumo-line">
+            <div className="mb-4">
+              <Text variant="heading3" as="h3">
+                Full Examples
+              </Text>
+            </div>
+            <div className="space-y-2">
+              {[
+                ["Computer skills", "examples/computer-skills"],
+                ["Workspace chat", "examples/workspace-chat"],
+                ["Computer package", "github.com/cloudflare/computer"],
+                ["Think package", "packages/think"]
+              ].map(([label, path]) => (
+                <div
+                  key={path}
+                  className="flex items-center justify-between gap-3 p-3 rounded bg-kumo-elevated"
+                >
+                  <Text size="sm" bold>
+                    {label}
+                  </Text>
+                  <code className="text-xs text-kumo-subtle">{path}</code>
+                </div>
+              ))}
+            </div>
+          </Surface>
+        </div>
+      </div>
+
+      <CodeExplanation sections={codeSections} />
+    </DemoWrapper>
+  );
+}

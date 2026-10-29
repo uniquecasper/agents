@@ -29,6 +29,18 @@ interface TryNOptions extends RetryOptions {
  * maxAttempts, and validates cross-field constraints after resolving against
  * defaults when provided.
  */
+/** Fill unset per-call retry options from a required set of defaults. */
+export function resolveRetryConfig(
+  retry: RetryOptions | undefined,
+  defaults: Required<RetryOptions>
+): Required<RetryOptions> {
+  return {
+    maxAttempts: retry?.maxAttempts ?? defaults.maxAttempts,
+    baseDelayMs: retry?.baseDelayMs ?? defaults.baseDelayMs,
+    maxDelayMs: retry?.maxDelayMs ?? defaults.maxDelayMs
+  };
+}
+
 export function validateRetryOptions(
   options: RetryOptions,
   defaults?: Required<RetryOptions>
@@ -281,6 +293,19 @@ export function isDurableObjectStorageReset(error: unknown): boolean {
     if (STORAGE_RESET_PATTERN.test(errorMessageOf(e))) return true;
   }
   return false;
+}
+
+/**
+ * Whether an error (or anything in its `cause` chain) is a Durable Object
+ * reset — a superseded isolate ({@link isDurableObjectCodeUpdateReset}) or a
+ * storage reset ({@link isDurableObjectStorageReset}). The isolate is going
+ * away, so live chat recovery must not schedule a retry for it: the restart's
+ * own recovery owns the turn.
+ */
+export function isDurableObjectResetError(error: unknown): boolean {
+  return (
+    isDurableObjectCodeUpdateReset(error) || isDurableObjectStorageReset(error)
+  );
 }
 
 /**

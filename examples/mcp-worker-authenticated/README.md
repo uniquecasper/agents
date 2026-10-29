@@ -34,18 +34,26 @@ The `OAuthProvider` wraps the entire Worker. It intercepts OAuth endpoints (`/au
 ```typescript
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler, getMcpAuthContext } from "agents/mcp/server";
+import { env } from "cloudflare:workers";
 
-const apiHandler = createMcpHandler(createServer);
+const mcpHandler = createMcpHandler(createServer);
 
 export default new OAuthProvider({
   authorizeEndpoint: "/authorize",
   tokenEndpoint: "/oauth/token",
   clientRegistrationEndpoint: "/oauth/register",
   apiRoute: "/mcp",
-  apiHandler,
-  defaultHandler: { fetch: (req, env, ctx) => AuthHandler.fetch(req, env, ctx) }
+  // OAuthProvider needs an object with a fetch method, not a function.
+  apiHandler: { fetch: (req, env, ctx) => mcpHandler(req, env, ctx) },
+  defaultHandler: {
+    fetch: (req, env, ctx) => AuthHandler.fetch(req, env, ctx)
+  },
+  // The URL MCP clients connect to. Every token is bound to it.
+  resourceMetadata: { resource: env.MCP_RESOURCE }
 });
 ```
+
+Set `MCP_RESOURCE` in `wrangler.jsonc` to your deployed URL, for example `https://mcp-worker-authenticated.<your-subdomain>.workers.dev/mcp`. The default, `http://localhost:5173/mcp`, works with `pnpm start`. If `MCP_RESOURCE` doesn't match the origin the Worker is served from, the example returns a 500 that names the value to set.
 
 Inside tool handlers, access standard token metadata and the existing application props. Do not log or return the raw access token:
 

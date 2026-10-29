@@ -1,8 +1,7 @@
 # Durable Object lifecycle
 
-> **Experimental.** Everything exported from `agents/lifecycle` — and the
-> capabilities built on it, including `Scheduler` — may change between
-> releases while the composition surface stabilizes.
+`agents/lifecycle` is stable. Most capabilities built on it are still
+experimental; each capability's page says which.
 
 `agents/lifecycle` lets reusable durable capabilities work in both `Agent` and a
 plain Cloudflare Durable Object. It uses composition: your class extends the
@@ -138,11 +137,16 @@ sequentially. Request handling is middleware dispatch: it stops at the first
 returned `Response`, and returning `undefined` passes the request on. A phase
 failure propagates, and failed startup can be retried.
 
-A capability installed with `{ fallback: true }` dispatches after every
-non-fallback capability, whenever it was installed. This is for a host's
-catch-all: `Agent` installs its WebSockets capability as a fallback, so a
-subclass that installs request or upgrade middleware from its own
-constructor still runs first, even though `Agent`'s constructor ran earlier.
+A capability declares how it claims traffic with `claims`, which defaults to
+`"selective"`. A `"catch-all"` capability dispatches after every other
+capability, whenever it was installed. Catch-alls are unique per dispatch
+hook: Lifecycle refuses a second catch-all for `onRequest` or for
+`onWebSocketUpgrade`, since it could never be reached, but one of each
+coexists. The `WebSockets` capability is a catch-all for upgrades only, so
+an HTTP catch-all installs beside it, and selective HTTP capabilities that
+target their own routes run before both. A subclass that installs request or
+upgrade middleware from its own constructor still runs first, even though
+`Agent`'s constructor ran earlier.
 
 Capabilities extending `LifecycleCapability` receive one standard service
 surface: storage, readiness, startup state, the job queue, a host
@@ -151,10 +155,50 @@ Host-specific bindings, authentication, and protocol adapters remain explicit
 constructor dependencies. Lifecycle never grants a capability the complete
 host implicitly.
 
+A capability's public operations can run before startup, because
+[native RPC](#native-rpc) bypasses the automatic startup on fetch, alarm and
+WebSocket events. If an operation starts work that `onStart` also awaits, such
+as lazily opening a store, it must call `await this.lifecycle.ready()` first:
+
+```ts
+class Store extends LifecycleCapability {
+  #opening: Promise<Database> | undefined;
+
+  constructor() {
+    super("store");
+  }
+
+  async onStart(): Promise<void> {
+    await this.#open();
+  }
+
+  async get(key: string): Promise<string | undefined> {
+    const db = await this.#open();
+    return db.get(key);
+  }
+
+  async #open(): Promise<Database> {
+    // Without this, an RPC that calls get() before startup begins the open
+    // outside startup, and onStart then waits on it behind a closed gate.
+    await this.lifecycle.ready();
+    this.#opening ??= openDatabase(this.lifecycle.storage);
+    return this.#opening;
+  }
+}
+```
+
+Startup holds the input gate (`blockConcurrencyWhile`) while `onStart` runs, so
+work begun outside startup has its timers and I/O held back and never finishes.
+`onStart` waits on it until startup times out after 30 seconds and the object
+is reset. Whether it happens depends on whether the RPC arrives first, so it
+shows up as an intermittent timeout. `ready()` resolves immediately inside
+startup, so `onStart` can call the same guarded method. `Tasks`, `Streams`,
+`Scheduler`, `Queue` and `PiHarness` guard their operations this way.
+
 Capability hooks run outside host context, but user callbacks run through
 `this.lifecycle.runInHostContext(fn)` inside the host invocation context.
-Scheduler dispatches its registered callbacks through this boundary, and a
-future capability that calls user code should do the same.
+Scheduler and Queue dispatch their registered callbacks through this
+boundary, and a future capability that calls user code should do the same.
 
 ## The job queue
 
@@ -190,7 +234,13 @@ physical alarm automatically — there is no explicit rearm call. When the
 alarm fires, Lifecycle drives due jobs in due order as an event loop, then
 runs host `onAlarm()`, then re-arms from queue state. Before driving any job
 it arms a deadman pre-alarm so an isolate death mid-drive still wakes the
-object to resume.
+object to resume. While the queue holds jobs, it also arms a fallback alarm
+before startup runs, at the next job's time but at least 30 seconds out. An
+alarm whose startup throws still leaves that wake, whether or not the
+platform's own alarm retries run, so the failed startup is retried then. A
+startup that pushes or reschedules jobs and then throws, from an alarm or a
+request, arms the same fallback from the queue as it stands, so those jobs
+keep a wake too.
 
 A job's drive result decides what happens next: returning nothing completes
 and deletes it, `{ rescheduleAt }` suspends it until a future time, and
@@ -306,8 +356,8 @@ to export `getCurrentAgent()` for the `Agent` class as a compatibility alias.
 
 Lifecycle itself does not model WebSockets. Hosts that want connections
 install the `WebSockets` capability, which owns the subsystem end to end —
-it claims upgrades, accepts hibernating sockets, dispatches handlers inside
-the host invocation boundary, and answers `getConnections()`:
+it claims upgrades, dispatches handlers inside the host invocation boundary,
+and answers `getConnections()`:
 
 ```ts
 import { WebSockets } from "agents/websockets";
@@ -321,7 +371,8 @@ export class MyObject extends DurableObject<Env> {
       onMessage: (connection, message) => {
         connection.send(`echo:${message}`);
       }
-    }
+    },
+    callables: new MyCallables(this)
   });
   readonly lifecycle = Lifecycle.install(this).use(this.webSockets);
 }
@@ -329,18 +380,91 @@ export class MyObject extends DurableObject<Env> {
 
 Without the capability installed, WebSocket upgrades are declined.
 
-The capability can also serve remote methods: pass an `RpcTarget` as
-`callables` and its prototype methods become the complete remote interface,
-served over a Cap'n Web session (`?__agents_rpc=capnweb`). An `Agent` adds
-no new surface for this — its `@callable()`-decorated methods are its
-interface, served on every wire: natively over the legacy JSON RPC protocol
-and, through the decorator-derived target, over the Cap'n Web endpoint.
+### A plain host works with `useAgent`
 
-Connections use Cloudflare's WebSocket Hibernation API. Idle clients remain
-connected while the Durable Object can leave memory; when a message wakes the
-object, its constructor and lifecycle startup run again before `onMessage`.
-State needed after a wake must be stored durably or through
-`connection.setState()`. There is no non-hibernating mode.
+The capability speaks the Agent protocol on every connection, so a plain
+Durable Object is reachable from `useAgent` and `AgentClient` exactly like an
+`Agent`:
+
+- On connect it sends the identity frame, then the current state when
+  `state` is set. The identity frame says when a state frame follows it,
+  so the client's `ready` and `identified` wait for that state, and a
+  caller awaiting `ready` never reads the default value.
+  `protocol` controls this: `true` (default) for every connection, a
+  function to decide per connection — `false` marks it no-protocol, so it
+  gets no protocol text frames on connect or by broadcast but still sends
+  and receives ordinary messages and callables — or `false` to have the
+  host drive the sequence itself with `sendConnectFrames()`, or
+  `sendIdentity()` and `sendState()` separately (the client then resolves
+  `ready` on the identity alone).
+  `Agent` passes `false`, because it must decide whether a connection
+  belongs to a facet before any frame is sent.
+- `readonly` decides per connection whether state writes over the wire are
+  refused; `setReadonly()` flips it later. Both flags are stored in the
+  connection's own state under `_cf_` keys, hidden from `connection.state`
+  and preserved across `setState`, so they survive hibernation. `Agent`'s
+  `isConnectionReadonly`, `setConnectionReadonly`, and
+  `isConnectionProtocolEnabled` delegate to the same storage.
+- `callables` is an `RpcTarget` whose prototype methods are the host's
+  complete remote interface, reached through `call()` and `stub`. On the
+  `cf-websocket` wire the capability answers them as JSON `rpc` frames. On
+  the `capnweb` wire they are native Cap'n Web methods on the session root:
+  a returned `RpcTarget` arrives as a live stub the client can keep
+  calling, a `ReadableStream` streams, and chained calls pipeline. Methods
+  run through the host invocation boundary with the calling connection in
+  scope.
+- `state` takes a `State` capability (from `agents/state`) and syncs it over
+  connections, so `useAgent().state` and `setState()` work against a plain
+  host:
+
+  ```ts
+  readonly state = new State({
+    initialState: { count: 0 },
+    // The state owner decides who hears about a change.
+    onChanged: (_state, source) => this.webSockets.broadcastState(source)
+  });
+  readonly webSockets = new WebSockets({ state: this.state });
+  readonly lifecycle = Lifecycle.install(this)
+    .use(this.state)
+    .use(this.webSockets);
+  ```
+
+  The current value is pushed to each new connection after identity. A
+  client's `cf_agent_state` frame goes through the `State` capability, so
+  the host's own `validateStateChange` decides; a readonly connection is
+  refused, and a rejected change is logged server-side and answered with a
+  generic `cf_agent_state_error`. `broadcastState(source)` pushes the
+  current value to every protocol-enabled connection except `source`. This
+  is distinct from `connection.setState()`, which is per-connection and
+  never leaves the host. Without the option, state is never sent or
+  accepted over connections.
+
+- Any other frame goes to `handlers.onMessage`.
+
+An `Agent` adds no new surface for this: its `@callable()`-decorated methods
+are its JSON-wire interface, answered by its own message handler. They are
+not mirrored onto the Cap'n Web root; an Agent that wants native calls on
+`capnweb` passes a `callables` target like any other host.
+
+### Two wires
+
+The client chooses how frames travel:
+
+- **`cf-websocket`** (default) — accepted with Cloudflare's WebSocket Hibernation
+  API. Idle clients remain connected while the Durable Object leaves memory;
+  when a message wakes it, the constructor and lifecycle startup run again
+  before `onMessage`. State needed after a wake belongs in storage or
+  `connection.setState()`.
+- **Cap'n Web** (`?__agents_transport=capnweb`, or
+  `useAgent({ transport: "capnweb" })`) — protocol frames travel through one
+  pipe method on a Cap'n Web session whose root also carries the host's
+  `callables` natively. The connection is an in-memory socket and does not
+  hibernate: the object stays pinned while it is open, and clients reconnect
+  after an eviction.
+
+Handlers are wire-agnostic. Both kinds of connection dispatch the same
+`onConnect`/`onMessage`/`onClose`/`onError`, appear in `getConnections()`,
+and honour `connection.close(code, reason)`.
 
 ## Native RPC
 
@@ -354,7 +478,19 @@ async runTask(): Promise<void> {
 }
 ```
 
-Agent's internal RPC entry points already enforce this boundary.
+An `Agent` enforces this boundary for you. Its internal RPC entry points and
+the public `async` methods your subclass exposes over RPC start the lifecycle
+before they run, so a cold instance does not serve those calls against
+uninitialized state. Synchronous methods are never deferred; if one reads state
+that `onStart` sets up, make it `async` or call `await this.lifecycle.start()`
+in it. Concurrent calls to `start()` share the same startup operation, and
+`lifecycle.isStarted()` returns `true` only after capabilities and `onStart()`
+have finished.
+
+Startup resolves the Durable Object name. An async RPC to an Agent addressed
+with `newUniqueId()` or `idFromString()` fails instead of running before
+initialization. Address the Agent by name with `getAgentByName()`, `getByName()`,
+or `idFromName()`.
 
 ## Object names
 

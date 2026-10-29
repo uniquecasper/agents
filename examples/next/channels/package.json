@@ -1,0 +1,42 @@
+{
+  "name": "@cloudflare/agents-next-channels-example",
+  "description": "Agents on different harnesses served to browsers and terminals through Channels",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "scripts": {
+    "start": "vite dev",
+    "deploy": "vite build && wrangler deploy",
+    "types": "wrangler types env.d.ts --include-runtime false",
+    "tui": "node src/ai-sdk-tui.ts",
+    "tui2": "sh -c 'tsx ../../../packages/agents/src/cli/index.ts tui \"${AGENT_ORIGIN:-http://localhost:5173}/channels/${1:-ai-sdk}/${2:-default}\" --as \"terminal-$$\"' tui2"
+  },
+  "dependencies": {
+    "@cloudflare/kumo": "^2.6.0",
+    "@earendil-works/chord": "~1.4.0",
+    "@earendil-works/pi-ai": "~1.4.0",
+    "@earendil-works/pi-durable": "~1.4.0",
+    "@earendil-works/pi-telemetry": "~1.4.0",
+    "agents": "*",
+    "ai": "^7.0.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "typebox": "1.3.27",
+    "workers-ai-provider": "^4.0.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@ai-sdk/tui": "1.0.119",
+    "@cloudflare/vite-plugin": "1.62.3",
+    "@cloudflare/workers-types": "^5.20261014.1",
+    "@tailwindcss/vite": "^4",
+    "@types/node": "^26.0.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "tailwindcss": "^4.3.2",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.6",
+    "wrangler": "^4.145.0"
+  }
+}

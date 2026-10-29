@@ -5,6 +5,14 @@ export default defineConfig({
     projects: [
       "src/tests/vitest.config.ts",
       "src/react-tests/vitest.config.ts",
+      "src/voice/tests/vitest.config.ts",
+      "src/voice/react-tests/vitest.config.ts",
+      "src/harness/opencode/tests/vitest.config.ts",
+      "src/harness/pi/tests/vitest.config.ts",
+      "src/harness/think/tests/vitest.config.ts",
+      "src/harness/container/tests/vitest.config.ts",
+      "src/harness/container/runtime/tests/vitest.config.ts",
+      "src/experimental/channels/vitest.config.ts",
       "src/node-tests/vitest.config.ts",
       "src/x402-tests/vitest.config.ts",
       "src/chat/__tests__/vitest.config.ts",
@@ -13,6 +21,7 @@ export default defineConfig({
       //   (spawns real `wrangler dev` + SIGKILL); runs nightly via the `e2e-agents`
       //   job in .github/workflows/nightly.yml, or locally via `pnpm run test:e2e`.
       // "src/browser-tests/vitest.config.ts" — run via `pnpm run test:browser` (spawns wrangler + Chromium)
+      // "src/otel-tests/vitest.config.ts" — run via `pnpm run test:otel-runtime` (packs the package, spawns wrangler dev)
     ]
   }
 });

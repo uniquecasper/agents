@@ -11,7 +11,9 @@ import {
   type LifecycleJobContext,
   type LifecycleJobPushOptions
 } from "../../lifecycle";
+import { State } from "../../state";
 import { WebSockets } from "../../websockets";
+import { LiveInstances } from "../shared/live-instances";
 
 type StartupProps = { label: string };
 
@@ -242,6 +244,16 @@ class PlainHostCallables extends RpcTarget {
     return this.#greeting;
   }
 
+  /** An RpcTarget result: a live stub on Cap'n Web, unserializable as JSON. */
+  counter(): Counter {
+    return new Counter();
+  }
+
+  /** A value JSON cannot carry; the JSON wire must still settle the call. */
+  bigint(): { value: bigint } {
+    return { value: 1n };
+  }
+
   streamNumbers(): ReadableStream<number> {
     return new ReadableStream<number>({
       start(controller) {
@@ -251,6 +263,20 @@ class PlainHostCallables extends RpcTarget {
         controller.close();
       }
     });
+  }
+}
+
+/** Returned by reference over Cap'n Web: the caller gets a live stub. */
+class Counter extends RpcTarget {
+  #value = 0;
+
+  increment(by = 1): number {
+    this.#value += by;
+    return this.#value;
+  }
+
+  value(): number {
+    return this.#value;
   }
 }
 
@@ -280,6 +306,11 @@ export class PlainLifecycleObject extends DurableObject<Cloudflare.Env> {
       onClose: () => {
         this.#webSocketContexts.push(currentWebSocketContext("close"));
       }
+    },
+    // `?tags=N` asks for N user tags, to probe the shared tag policy.
+    getConnectionTags: (_connection, { request }) => {
+      const count = Number(new URL(request.url).searchParams.get("tags") ?? 0);
+      return Array.from({ length: count }, (_, i) => `t${i}`);
     },
     callables: new PlainHostCallables()
   });
@@ -319,6 +350,31 @@ export class PlainLifecycleObject extends DurableObject<Cloudflare.Env> {
         this.#events.push("dispose:second");
       }
     });
+
+  /** Open connections on either wire, for transport tests. */
+  connectionCount(): number {
+    return [...this.#webSockets.getConnections()].length;
+  }
+
+  /** Tags of one connection, for transport tests. */
+  connectionTags(id: string): readonly string[] | undefined {
+    return this.#webSockets.getConnection(id)?.tags;
+  }
+
+  /**
+   * Close one connection from the host side. Returns the error message when
+   * `close()` throws (reserved code, oversize reason), else null.
+   */
+  closeConnection(id: string, code: number, reason: string): string | null {
+    const connection = this.#webSockets.getConnection(id);
+    if (!connection) return "no such connection";
+    try {
+      connection.close(code, reason);
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
 
   onStart(props?: StartupProps): void {
     this.#hostContexts.push(currentLifecycleContext("start"));
@@ -635,5 +691,309 @@ export class RetryableStartObject extends DurableObject<Cloudflare.Env> {
 
   getHostStarts(): number {
     return this.hostStarts;
+  }
+}
+
+/**
+ * Fails startup while its object's storage holds `fail-start`. When storage
+ * also holds `push-during-start`, a failing startup first pushes a job due at
+ * that time, so a test can check the job still gets a wake.
+ */
+class StoredStartFailureProbe extends LifecycleCapability {
+  constructor() {
+    super("stored-start-failure-probe");
+  }
+
+  async onStart(): Promise<void> {
+    if (!(await this.lifecycle.storage.get<boolean>("fail-start"))) return;
+    const pushTime =
+      await this.lifecycle.storage.get<number>("push-during-start");
+    if (pushTime !== undefined) {
+      await this.push({
+        id: "pushed-during-start",
+        fn: "tick",
+        time: pushTime
+      });
+    }
+    throw new Error("intentional startup failure");
+  }
+
+  async onJob(): Promise<void> {}
+
+  push(options: LifecycleJobPushOptions) {
+    return this.lifecycle.jobs.push(options);
+  }
+}
+
+/** Every {@link EvictableStartObject} instance, by object name. */
+const evictableStartInstances = new LiveInstances();
+
+/**
+ * Starts by storing a promise that never settles but has a reaction, as
+ * pi's Harness does. Every promise reaction keeps the async context it was
+ * created in, so the capability is reachable from its startup context.
+ */
+class PendingReactionProbe extends LifecycleCapability {
+  pending: Promise<void> | undefined;
+
+  constructor() {
+    super("pending-reaction-probe");
+  }
+
+  onStart(): void {
+    const pending = new Promise<void>(() => {});
+    void pending.then(() => {});
+    this.pending = pending;
+  }
+}
+
+/**
+ * Holds a queued job whose alarm runs into a failing startup, so a test can
+ * check the queue still has a wake after that alarm fails.
+ */
+export class AlarmStartFailureObject extends DurableObject<Cloudflare.Env> {
+  readonly #probe = new StoredStartFailureProbe();
+  readonly lifecycle = Lifecycle.install(this).use(this.#probe);
+
+  /** Queue a job due at `time`, then make every later startup fail. */
+  async queueJobThenFailStartup(time: number): Promise<void> {
+    await this.lifecycle.start();
+    await this.#probe.push({ id: "pending", fn: "tick", time });
+    await this.ctx.storage.put("fail-start", true);
+  }
+
+  /**
+   * Make every later startup push a job due at `pushTime` and then fail. When
+   * `queuedTime` is given, first queue a job due then.
+   */
+  async failStartupAfterPushing(
+    pushTime: number,
+    queuedTime?: number
+  ): Promise<void> {
+    await this.lifecycle.start();
+    if (queuedTime !== undefined) {
+      await this.#probe.push({ id: "pending", fn: "tick", time: queuedTime });
+    }
+    await this.ctx.storage.put("push-during-start", pushTime);
+    await this.ctx.storage.put("fail-start", true);
+  }
+
+  /** Start the lifecycle from a request, returning the startup error. */
+  async tryStart(): Promise<string> {
+    try {
+      await this.lifecycle.start();
+      return "started";
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+}
+
+/**
+ * Proves an evicted object can be garbage collected after a capability
+ * started work that never settles. Tests evict it repeatedly, then count
+ * the instances still alive after a forced GC.
+ */
+export class EvictableStartObject extends DurableObject<Cloudflare.Env> {
+  readonly lifecycle = Lifecycle.install(this).use(new PendingReactionProbe());
+
+  constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
+    super(ctx, env);
+    evictableStartInstances.track(ctx.id.name ?? "", this);
+  }
+
+  async startLifecycle(): Promise<void> {
+    await this.lifecycle.start();
+  }
+
+  /** Count this object's instances still alive after a forced GC. */
+  countLiveInstances(): Promise<number> {
+    return evictableStartInstances.countAfterGC(this.ctx.id.name ?? "");
+  }
+}
+
+export type ConcurrentStartOptions = {
+  /** Make the capability's start throw after yielding. */
+  readonly failCapability?: boolean;
+  /** Have the capability call `lifecycle.start()` with replacement props. */
+  readonly nestFromCapability?: boolean;
+  /** Have the host `onStart` call `lifecycle.start()`. */
+  readonly nestFromHost?: boolean;
+  /** Have the capability wait for capability-operation readiness. */
+  readonly nestReadyFromCapability?: boolean;
+};
+
+/** Performs a capability operation gated on Lifecycle readiness. */
+class ReadyGatedProbe extends LifecycleCapability {
+  constructor(private readonly isHostReady: () => boolean) {
+    super("ready-gated-probe");
+  }
+
+  waitUntilReady(): Promise<void> {
+    return this.lifecycle.ready();
+  }
+
+  async operation(): Promise<string> {
+    try {
+      await this.lifecycle.ready();
+      return this.isHostReady() ? "ready" : "not-ready";
+    } catch (error) {
+      return `rejected:${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+}
+
+/**
+ * Proves concurrent and nested `lifecycle.start()` calls: independent callers
+ * share one startup and observe its outcome, while calls made from inside
+ * startup return without waiting on it.
+ */
+export class ConcurrentStartObject extends DurableObject<Cloudflare.Env> {
+  readonly events: string[] = [];
+  #options: ConcurrentStartOptions = {};
+  #markStartBegan: () => void = () => {};
+  readonly #startBegan = new Promise<void>((resolve) => {
+    this.#markStartBegan = resolve;
+  });
+  readonly #readyProbe = new ReadyGatedProbe(() => this.ready);
+  ready = false;
+
+  readonly lifecycle = Lifecycle.install<Cloudflare.Env, StartupProps>(this)
+    .use(this.#readyProbe)
+    .use({
+      onStart: async ({ props }) => {
+        this.events.push(`capability:start:${props?.label ?? "none"}`);
+        this.#markStartBegan();
+        if (this.#options.nestReadyFromCapability) {
+          await this.#readyProbe.waitUntilReady();
+          this.events.push("capability:nested-ready-returned");
+        }
+        if (this.#options.nestFromCapability) {
+          await this.lifecycle.start({ label: "replacement" });
+          this.events.push("capability:nested-returned");
+        }
+        await this.ctx.storage.get("yield");
+        if (this.#options.failCapability) {
+          throw new Error("intentional concurrent startup failure");
+        }
+      }
+    });
+
+  async onStart(props?: StartupProps): Promise<void> {
+    this.events.push(`host:start:${props?.label ?? "none"}`);
+    if (this.#options.nestFromHost) {
+      await this.lifecycle.start();
+      this.events.push("host:nested-returned");
+    }
+    await this.ctx.storage.get("yield");
+    this.ready = true;
+  }
+
+  async startConcurrently(
+    options: ConcurrentStartOptions = {}
+  ): Promise<{ observed: string[]; events: string[] }> {
+    this.#options = options;
+    const observe = (caller: string) =>
+      this.lifecycle.start({ label: caller }).then(
+        () => `${caller}:${this.ready ? "ready" : "not-ready"}`,
+        (error: unknown) =>
+          `${caller}:rejected:${error instanceof Error ? error.message : String(error)}`
+      );
+    const observed = await Promise.all([observe("first"), observe("second")]);
+    return { observed, events: this.events };
+  }
+
+  /**
+   * Start, then run an independent capability operation once startup is
+   * mid-flight, and report what each observed.
+   */
+  async operateDuringStartup(
+    options: ConcurrentStartOptions = {}
+  ): Promise<{ start: string; operation: string; events: string[] }> {
+    this.#options = options;
+    const start = this.lifecycle.start({ label: "first" }).then(
+      () => (this.ready ? "ready" : "not-ready"),
+      (error: unknown) =>
+        `rejected:${error instanceof Error ? error.message : String(error)}`
+    );
+    const operation = this.#startBegan.then(() => this.#readyProbe.operation());
+    const [startResult, operationResult] = await Promise.all([
+      start,
+      operation
+    ]);
+    return {
+      start: startResult,
+      operation: operationResult,
+      events: this.events
+    };
+  }
+}
+
+/**
+ * A plain Durable Object composed with `State` and `WebSockets`, wired so
+ * the capability syncs state over connections. Used to prove `useAgent`'s
+ * state surface works against a non-Agent host.
+ */
+export class StatefulPlainObject extends DurableObject<Cloudflare.Env> {
+  readonly #state: State<{ count: number }> = new State<{ count: number }>({
+    initialState: { count: 0 },
+    validateStateChange: (next, source) => {
+      if (next.count < 0) throw new Error("count must not be negative");
+      // The ambient context names the connection the change came from,
+      // exactly as an Agent's validateStateChange sees it.
+      const ambient = getCurrentAgent().connection;
+      if (source !== "server" && ambient?.id !== source.id) {
+        throw new Error(
+          "validator ran outside the sending connection's context"
+        );
+      }
+    },
+    // The state owner decides who hears about a change: everyone but the
+    // connection it came from.
+    onChanged: (_next, source): void => {
+      this.#webSockets.broadcastState(source);
+    }
+  });
+
+  readonly #webSockets: WebSockets = new WebSockets({
+    state: this.#state,
+    // `?readonly=1` connections may not write; `?silent=1` connections get
+    // no protocol frames at all.
+    readonly: (_connection, { request }) =>
+      new URL(request.url).searchParams.has("readonly"),
+    protocol: (_connection, { request }) =>
+      !new URL(request.url).searchParams.has("silent"),
+    handlers: {
+      onMessage: (connection, message) => {
+        connection.send(`echo:${String(message)}`);
+      }
+    }
+  });
+
+  readonly lifecycle = Lifecycle.install(this)
+    .use(this.#state)
+    .use(this.#webSockets);
+
+  /** Host-side change; onChanged broadcasts it. */
+  async setCount(count: number): Promise<void> {
+    await this.lifecycle.start();
+    this.#state.set({ count });
+  }
+
+  async isReadonly(id: string): Promise<boolean | undefined> {
+    await this.lifecycle.start();
+    const connection = this.#webSockets.getConnection(id);
+    return connection ? this.#webSockets.isReadonly(connection) : undefined;
+  }
+
+  async setReadonly(id: string, readonly: boolean): Promise<void> {
+    await this.lifecycle.start();
+    const connection = this.#webSockets.getConnection(id);
+    if (connection) this.#webSockets.setReadonly(connection, readonly);
+  }
+
+  async getCount(): Promise<number | undefined> {
+    await this.lifecycle.start();
+    return this.#state.get()?.count;
   }
 }

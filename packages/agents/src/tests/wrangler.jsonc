@@ -21,8 +21,24 @@
         "name": "PlainLifecycleObject"
       },
       {
+        "class_name": "StatefulPlainObject",
+        "name": "StatefulPlainObject"
+      },
+      {
         "class_name": "RetryableStartObject",
         "name": "RetryableStartObject"
+      },
+      {
+        "class_name": "AlarmStartFailureObject",
+        "name": "AlarmStartFailureObject"
+      },
+      {
+        "class_name": "ConcurrentStartObject",
+        "name": "ConcurrentStartObject"
+      },
+      {
+        "class_name": "EvictableStartObject",
+        "name": "EvictableStartObject"
       },
       {
         "class_name": "ScheduledLifecycleObject",
@@ -37,6 +53,26 @@
         "name": "SchedulerStartupWarnObject"
       },
       {
+        "class_name": "QueueHarnessObject",
+        "name": "QueueHarnessObject"
+      },
+      {
+        "class_name": "BrowserHarnessObject",
+        "name": "BrowserHarnessObject"
+      },
+      {
+        "class_name": "InternalHostsPlainObject",
+        "name": "InternalHostsPlainObject"
+      },
+      {
+        "class_name": "InternalHostsNoMethodObject",
+        "name": "InternalHostsNoMethodObject"
+      },
+      {
+        "class_name": "TestBrowserAgent",
+        "name": "TestBrowserAgent"
+      },
+      {
         "class_name": "TaskHarnessObject",
         "name": "TaskHarnessObject"
       },
@@ -47,6 +83,22 @@
       {
         "class_name": "StreamHarnessObject",
         "name": "StreamHarnessObject"
+      },
+      {
+        "class_name": "ChannelsHarnessObject",
+        "name": "ChannelsHarnessObject"
+      },
+      {
+        "class_name": "AiSdkHarnessObject",
+        "name": "AiSdkHarnessObject"
+      },
+      {
+        "class_name": "CutoverHarnessObject",
+        "name": "CutoverHarnessObject"
+      },
+      {
+        "class_name": "SqliteStrategiesBench",
+        "name": "SqliteStrategiesBench"
       },
       {
         "class_name": "TaskStreamComposeObject",
@@ -239,6 +291,10 @@
         "name": "TestWaitConnectionsAgent"
       },
       {
+        "class_name": "TestNativeRpcAgent",
+        "name": "TestNativeRpcAgent"
+      },
+      {
         "class_name": "RoutingOwnerAgent",
         "name": "RoutingOwnerAgent"
       },
@@ -256,6 +312,12 @@
       },
       // Facet-only sub-agent fixtures. These bindings are test-harness-only;
       // production Workers only need to export child classes.
+      // The browser tool's codemode runtime facet (stays out of
+      // new_sqlite_classes; the host owns the SQLite store).
+      {
+        "class_name": "CodemodeRuntime",
+        "name": "CodemodeRuntime"
+      },
       {
         "class_name": "CounterSubAgent",
         "name": "CounterSubAgent"
@@ -263,6 +325,10 @@
       {
         "class_name": "OuterSubAgent",
         "name": "OuterSubAgent"
+      },
+      {
+        "class_name": "DenyingSubAgent",
+        "name": "DenyingSubAgent"
       },
       {
         "class_name": "InnerSubAgent",
@@ -344,6 +410,7 @@
     ]
   },
   "worker_loaders": [{ "binding": "LOADER" }],
+  "r2_buckets": [{ "binding": "SKILLS_BUCKET", "bucket_name": "skills-test" }],
   "workflows": [
     {
       "name": "test-processing-workflow",
@@ -397,13 +464,26 @@
       "new_sqlite_classes": [
         "CapabilityHarnessObject",
         "PlainLifecycleObject",
+        "StatefulPlainObject",
         "RetryableStartObject",
+        "AlarmStartFailureObject",
+        "ConcurrentStartObject",
+        "EvictableStartObject",
         "ScheduledLifecycleObject",
         "SchedulerHarnessObject",
         "SchedulerStartupWarnObject",
+        "QueueHarnessObject",
+        "BrowserHarnessObject",
+        "InternalHostsPlainObject",
+        "InternalHostsNoMethodObject",
+        "TestBrowserAgent",
         "TaskHarnessObject",
         "TaskSchedulerCoexistObject",
         "StreamHarnessObject",
+        "ChannelsHarnessObject",
+        "AiSdkHarnessObject",
+        "CutoverHarnessObject",
+        "SqliteStrategiesBench",
         "TaskStreamComposeObject",
         "StreamBenchObject",
         "SessionHarnessObject",
@@ -449,6 +529,7 @@
         "TestKeepAliveAgent",
         "TestSessionAgent",
         "TestWaitConnectionsAgent",
+        "TestNativeRpcAgent",
         "RoutingOwnerAgent",
         "RoutedChatAgent",
         "TestSubAgentParent",

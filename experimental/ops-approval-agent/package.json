@@ -10,13 +10,14 @@
     "types": "wrangler types env.d.ts --include-runtime false"
   },
   "dependencies": {
+    "@cloudflare/computer": "^0.8.0",
     "@cloudflare/think": "*",
     "agents": "*",
     "ai": "^7.0.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260729.1",
+    "@cloudflare/workers-types": "^5.20261014.1",
     "typescript": "^6.0.3",
-    "wrangler": "^4.115.0"
+    "wrangler": "^4.145.0"
   }
 }

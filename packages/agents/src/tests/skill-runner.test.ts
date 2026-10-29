@@ -3,43 +3,28 @@ import { env } from "cloudflare:workers";
 import { tool } from "ai";
 import { z } from "zod";
 import * as skills from "../skills";
-import type { SkillWorkspace } from "../skills";
+import { runner as createRunner } from "../skills/runner";
+import { MemorySkillWorkspace } from "./memory-skill-workspace";
 
-function testWorkspace(files: Record<string, string>): SkillWorkspace {
-  const info = (path: string) => ({
-    name: path,
-    path,
-    size: files[path].length,
-    type: "file" as const,
-    mimeType: "text/plain",
-    createdAt: 0,
-    updatedAt: 0
-  });
+function testSkill(
+  name: string,
+  description: string,
+  body: string
+): skills.Skill {
+  const parsed = skills.parseSkill(
+    `---\nname: ${name}\ndescription: ${description}\n---\n${body}`
+  );
+  if (!parsed.ok) throw parsed.error;
+  return parsed.value;
+}
 
-  return {
-    async readFile(path: string) {
-      return files[path] ?? null;
-    },
-    async writeFile(path: string, content: string) {
-      files[path] = content;
-    },
-    async readDir() {
-      return Object.keys(files).map(info);
-    },
-    async glob() {
-      return Object.keys(files).map(info);
-    },
-    async stat(path: string) {
-      const content = files[path];
-      if (content === undefined) return null;
-      return info(path);
-    }
-  };
+function testWorkspace(files: Record<string, string>): MemorySkillWorkspace {
+  return new MemorySkillWorkspace(files);
 }
 
 describe("skill script runner", () => {
   it("runs function-style JavaScript scripts with input, context, and tools", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER,
       tools: {
         shout: tool({
@@ -51,11 +36,11 @@ describe("skill script runner", () => {
 
     await expect(
       runner.run({
-        skill: {
-          name: "release-notes",
-          description: "Draft release notes.",
-          body: "Use the script."
-        },
+        skill: testSkill(
+          "release-notes",
+          "Draft release notes.",
+          "Use the script."
+        ),
         path: "scripts/format.js",
         input: { text: "hello" },
         source: `export default async function run(input, ctx) {
@@ -70,17 +55,13 @@ describe("skill script runner", () => {
   });
 
   it("surfaces script failures with console output", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "broken",
-          description: "Broken skill.",
-          body: "Run broken script."
-        },
+        skill: testSkill("broken", "Broken skill.", "Run broken script."),
         path: "scripts/broken.js",
         input: {},
         source: `export default async function run() {
@@ -92,17 +73,13 @@ describe("skill script runner", () => {
   });
 
   it("requires a default-exported function for JS/TS scripts", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "no-default",
-          description: "No default export.",
-          body: "Run script."
-        },
+        skill: testSkill("no-default", "No default export.", "Run script."),
         path: "scripts/run.ts",
         input: {},
         source: `console.log("no default export");`
@@ -110,22 +87,21 @@ describe("skill script runner", () => {
     ).rejects.toThrow("must `export default`");
   });
 
-  it("rejects an un-precompiled multi-file/TypeScript script with a compile-required error", async () => {
-    const runner = skills.runner({
+  it("rejects an uncompiled multi-file/TypeScript script with a compile-required error", async () => {
+    const runner = createRunner({
       loader: env.LOADER
     });
 
     // The runtime ships no in-Worker bundler: a TypeScript / multi-file script
     // that was not compiled ahead of time cannot run and must surface a clear
-    // "compile first" error (bundled skills are compiled by the Vite plugin;
-    // R2/dynamic skills must be bundled before upload).
+    // "compile first" error.
     await expect(
       runner.run({
-        skill: {
-          name: "release-notes",
-          description: "Draft release notes.",
-          body: "Use the script."
-        },
+        skill: testSkill(
+          "release-notes",
+          "Draft release notes.",
+          "Use the script."
+        ),
         path: "scripts/format.ts",
         input: { text: "hello" },
         source: `import { format } from "./helper";
@@ -146,22 +122,37 @@ export default function run(input: { text: string }) {
     ).rejects.toThrow("must be compiled to a self-contained JavaScript module");
   });
 
-  it("runs a precompiled bundled script (esbuild `export { run as default }` form)", async () => {
-    const runner = skills.runner({
+  it("rejects a JavaScript script that imports sibling files", async () => {
+    const runner = createRunner({ loader: env.LOADER });
+
+    await expect(
+      runner.run({
+        skill: testSkill("release-notes", "Draft release notes.", "Use it."),
+        path: "scripts/format.js",
+        input: {},
+        source: `import { format } from "./helper.js";
+export default function run() {
+  return format("x");
+}`
+      })
+    ).rejects.toThrow("must be compiled to a self-contained JavaScript module");
+  });
+
+  it("runs a bundled script (esbuild `export { run as default }` form)", async () => {
+    const runner = createRunner({
       loader: env.LOADER
     });
 
-    // Build-time compilation (esbuild) emits the default export as
-    // `export { run as default }` and inlines siblings. The runner must
-    // normalize this form and run it directly, without any bundler.
+    // esbuild emits the default export as `export { run as default }` and
+    // inlines siblings. The runner must normalize this form and run it.
     await expect(
       runner.run({
-        skill: {
-          name: "release-notes",
-          description: "Draft release notes.",
-          body: "Use the script."
-        },
-        path: "scripts/format.ts",
+        skill: testSkill(
+          "release-notes",
+          "Draft release notes.",
+          "Use the script."
+        ),
+        path: "scripts/format.js",
         input: { text: "hello" },
         source: `function format(text) {
   return text.toUpperCase();
@@ -174,10 +165,9 @@ export {
 };`,
         resources: [
           {
-            path: "scripts/format.ts",
+            path: "scripts/format.js",
             kind: "script",
             encoding: "text",
-            precompiled: true,
             content: `function format(text) {
   return text.toUpperCase();
 }
@@ -193,8 +183,8 @@ export {
     ).resolves.toBe("HELLO");
   });
 
-  it("runs a precompiled script that also has named exports alongside the default", async () => {
-    const runner = skills.runner({
+  it("runs a bundled script that also has named exports alongside the default", async () => {
+    const runner = createRunner({
       loader: env.LOADER
     });
 
@@ -211,20 +201,19 @@ export {
 };`;
     await expect(
       runner.run({
-        skill: {
-          name: "release-notes",
-          description: "Draft release notes.",
-          body: "Use the script."
-        },
-        path: "scripts/format.ts",
+        skill: testSkill(
+          "release-notes",
+          "Draft release notes.",
+          "Use the script."
+        ),
+        path: "scripts/format.js",
         input: { text: "hello" },
         source,
         resources: [
           {
-            path: "scripts/format.ts",
+            path: "scripts/format.js",
             kind: "script",
             encoding: "text",
-            precompiled: true,
             content: source
           }
         ]
@@ -232,54 +221,18 @@ export {
     ).resolves.toBe("HELLO1");
   });
 
-  it("runs a precompiled script as-is without invoking the in-Worker bundler", async () => {
-    const runner = skills.runner({
-      loader: env.LOADER
-    });
-
-    // The entry resource is marked `precompiled` (as the Agents Vite plugin
-    // does at build time): the runner must run `source` directly and never
-    // reach for `@cloudflare/worker-bundler`, even though the path is `.ts`
-    // (which would otherwise force the runtime bundler).
-    await expect(
-      runner.run({
-        skill: {
-          name: "precompiled",
-          description: "Precompiled skill.",
-          body: "Run the precompiled script."
-        },
-        path: "scripts/digest.ts",
-        input: { text: "hello" },
-        source: `export default async function run(input) {
-  return input.text.toUpperCase();
-}`,
-        resources: [
-          {
-            path: "scripts/digest.ts",
-            kind: "script",
-            encoding: "text",
-            precompiled: true,
-            content: `export default async function run(input) {
-  return input.text.toUpperCase();
-}`
-          }
-        ]
-      })
-    ).resolves.toBe("HELLO");
-  });
-
   it("exposes text bundled resources through ctx.files", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "release-notes",
-          description: "Draft release notes.",
-          body: "Use the script."
-        },
+        skill: testSkill(
+          "release-notes",
+          "Draft release notes.",
+          "Use the script."
+        ),
         path: "scripts/read.js",
         input: {},
         source: `export default function run(input, ctx) {
@@ -299,18 +252,14 @@ export {
 
   it("returns output artifacts written through ctx.output", async () => {
     const workspace = testWorkspace({});
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER,
       workspaceInstance: workspace
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "writer",
-          description: "Write output.",
-          body: "Use the script."
-        },
+        skill: testSkill("writer", "Write output.", "Use the script."),
         path: "scripts/write.js",
         input: {},
         source: `export default async function run(input, ctx) {
@@ -329,21 +278,17 @@ export {
       ]
     });
     // Output artifacts are scratch, not durable workspace writes.
-    await expect(workspace.readFile("notes.md")).resolves.toBeNull();
+    await expect(workspace.readText("notes.md")).resolves.toBeNull();
   });
 
   it("rejects oversized output artifacts", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "writer",
-          description: "Write output.",
-          body: "Use the script."
-        },
+        skill: testSkill("writer", "Write output.", "Use the script."),
         path: "scripts/write.js",
         input: {},
         source: `export default async function run(input, ctx) {
@@ -354,7 +299,7 @@ export {
   });
 
   it("reads workspace files through ctx.workspace by default", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER,
       workspaceInstance: testWorkspace({
         "README.md": "hello from workspace"
@@ -363,11 +308,11 @@ export {
 
     await expect(
       runner.run({
-        skill: {
-          name: "workspace-reader",
-          description: "Read workspace files.",
-          body: "Use JS."
-        },
+        skill: testSkill(
+          "workspace-reader",
+          "Read workspace files.",
+          "Use JS."
+        ),
         path: "scripts/read.js",
         input: {},
         source: `export default async function run(input, ctx) {
@@ -377,8 +322,104 @@ export {
     ).resolves.toBe("hello from workspace");
   });
 
+  it("keeps ctx.workspace inside /workspace", async () => {
+    const workspace = testWorkspace({ "README.md": "inside" });
+    await workspace.writeText("/secrets/token.txt", "outside");
+    const runner = createRunner({
+      loader: env.LOADER,
+      workspaceInstance: workspace,
+      workspace: "read-write"
+    });
+    const run = (body: string) =>
+      runner.run({
+        skill: testSkill("escape", "Try to escape the workspace.", "Use JS."),
+        path: "scripts/escape.js",
+        input: {},
+        source: `export default async function run(input, ctx) {\n${body}\n}`
+      });
+
+    for (const path of [
+      "/secrets/token.txt",
+      "../secrets/token.txt",
+      "/workspace/../secrets/token.txt",
+      "./a/../../secrets/token.txt"
+    ]) {
+      await expect(
+        run(`return await ctx.workspace.readFile(${JSON.stringify(path)});`),
+        path
+      ).rejects.toThrow("can only access paths under /workspace");
+    }
+    await expect(
+      run('await ctx.workspace.writeFile("../secrets/token.txt", "x");')
+    ).rejects.toThrow("can only access paths under /workspace");
+    await expect(
+      run('return await ctx.workspace.glob("/secrets/*");')
+    ).rejects.toThrow("can only access paths under /workspace");
+    await expect(workspace.readText("/secrets/token.txt")).resolves.toBe(
+      "outside"
+    );
+
+    // Normalized paths that stay inside the root still work.
+    await expect(
+      run('return await ctx.workspace.readFile("./docs/../README.md");')
+    ).resolves.toBe("inside");
+  });
+
+  it("keeps python and bash workspace access inside /workspace", async () => {
+    const workspace = testWorkspace({});
+    await workspace.writeText("/secrets/token.txt", "outside");
+    const runner = createRunner({
+      loader: env.LOADER,
+      workspaceInstance: workspace
+    });
+
+    const bash = await runner.run({
+      skill: testSkill("escape", "Try to escape the workspace.", "Use bash."),
+      path: "scripts/escape.sh",
+      input: {},
+      source: "workspace-read ../secrets/token.txt"
+    });
+    expect(JSON.stringify(bash)).not.toContain("outside");
+    expect(JSON.stringify(bash)).toContain(
+      "can only access paths under /workspace"
+    );
+  });
+
+  it("returns sizes from ctx.workspace.glob, and nothing for a missing directory", async () => {
+    const runner = createRunner({
+      loader: env.LOADER,
+      workspaceInstance: testWorkspace({
+        "notes/a.md": "abc",
+        "notes/b.md": "hello"
+      })
+    });
+
+    await expect(
+      runner.run({
+        skill: testSkill(
+          "workspace-reader",
+          "Read workspace files.",
+          "Use JS."
+        ),
+        path: "scripts/glob.js",
+        input: {},
+        source: `export default async function run(input, ctx) {
+  const found = await ctx.workspace.glob("notes/*.md");
+  const missing = await ctx.workspace.glob("missing/**/*");
+  return { found, missing };
+}`
+      })
+    ).resolves.toEqual({
+      found: [
+        { path: "/workspace/notes/a.md", type: "file", size: 3 },
+        { path: "/workspace/notes/b.md", type: "file", size: 5 }
+      ],
+      missing: []
+    });
+  });
+
   it("normalizes ctx.workspace.stat to { type, size }", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER,
       workspaceInstance: testWorkspace({
         "README.md": "hello from workspace"
@@ -387,11 +428,11 @@ export {
 
     await expect(
       runner.run({
-        skill: {
-          name: "workspace-reader",
-          description: "Read workspace files.",
-          body: "Use JS."
-        },
+        skill: testSkill(
+          "workspace-reader",
+          "Read workspace files.",
+          "Use JS."
+        ),
         path: "scripts/stat.js",
         input: {},
         source: `export default async function run(input, ctx) {
@@ -403,18 +444,18 @@ export {
 
   it("requires read-write access for ctx.workspace writes", async () => {
     const readOnlyWorkspace = testWorkspace({});
-    const readOnlyRunner = skills.runner({
+    const readOnlyRunner = createRunner({
       loader: env.LOADER,
       workspaceInstance: readOnlyWorkspace
     });
 
     await expect(
       readOnlyRunner.run({
-        skill: {
-          name: "workspace-writer",
-          description: "Write workspace files.",
-          body: "Use JS."
-        },
+        skill: testSkill(
+          "workspace-writer",
+          "Write workspace files.",
+          "Use JS."
+        ),
         path: "scripts/write.js",
         input: {},
         source: `export default async function run(input, ctx) {
@@ -424,7 +465,7 @@ export {
     ).rejects.toThrow("Workspace write access is not available");
 
     const writeWorkspace = testWorkspace({});
-    const writeRunner = skills.runner({
+    const writeRunner = createRunner({
       loader: env.LOADER,
       workspaceInstance: writeWorkspace,
       workspace: "read-write"
@@ -432,11 +473,11 @@ export {
 
     await expect(
       writeRunner.run({
-        skill: {
-          name: "workspace-writer",
-          description: "Write workspace files.",
-          body: "Use JS."
-        },
+        skill: testSkill(
+          "workspace-writer",
+          "Write workspace files.",
+          "Use JS."
+        ),
         path: "scripts/write.js",
         input: {},
         source: `export default async function run(input, ctx) {
@@ -445,21 +486,21 @@ export {
 }`
       })
     ).resolves.toBe("done");
-    await expect(writeWorkspace.readFile("generated.md")).resolves.toBe("ok");
+    await expect(writeWorkspace.readText("generated.md")).resolves.toBe("ok");
   });
 
   it("denies ctx.workspace access when no workspace is provided", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "workspace-reader",
-          description: "Read workspace files.",
-          body: "Use JS."
-        },
+        skill: testSkill(
+          "workspace-reader",
+          "Read workspace files.",
+          "Use JS."
+        ),
         path: "scripts/read.js",
         input: {},
         source: `export default async function run(input, ctx) {
@@ -470,7 +511,7 @@ export {
   });
 
   it("runs bash skill scripts with input files and explicit tools", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER,
       tools: {
         shout: tool({
@@ -482,11 +523,11 @@ export {
 
     await expect(
       runner.run({
-        skill: {
-          name: "release-notes",
-          description: "Draft release notes.",
-          body: "Use the bash script."
-        },
+        skill: testSkill(
+          "release-notes",
+          "Draft release notes.",
+          "Use the bash script."
+        ),
         path: "scripts/format.sh",
         input: { text: "hello" },
         source: `echo "input=$(cat /input.json)"
@@ -509,17 +550,17 @@ tool shout '{"text":"hello"}'`,
   });
 
   it("mounts binary resources for bash scripts as decoded bytes", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "binary-reader",
-          description: "Read binary resources.",
-          body: "Use the bash script."
-        },
+        skill: testSkill(
+          "binary-reader",
+          "Read binary resources.",
+          "Use the bash script."
+        ),
         path: "scripts/read.sh",
         input: {},
         source: "content=$(cat /skill/assets/data.bin)\necho ${#content}",
@@ -540,17 +581,17 @@ tool shout '{"text":"hello"}'`,
   });
 
   it("returns non-zero bash exits without throwing", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "failing-bash",
-          description: "Fail with output.",
-          body: "Use the bash script."
-        },
+        skill: testSkill(
+          "failing-bash",
+          "Fail with output.",
+          "Use the bash script."
+        ),
         path: "scripts/fail.sh",
         input: {},
         source: 'echo "before failure"\necho "bad" >&2\nexit 7'
@@ -563,17 +604,13 @@ tool shout '{"text":"hello"}'`,
   });
 
   it("rejects unsafe mounted resource paths", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "unsafe",
-          description: "Unsafe paths.",
-          body: "Use python."
-        },
+        skill: testSkill("unsafe", "Unsafe paths.", "Use python."),
         path: "scripts/read.py",
         input: {},
         source: `print("nope")`,
@@ -590,17 +627,17 @@ tool shout '{"text":"hello"}'`,
   });
 
   it("runs python skill scripts with input and context", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "release-notes",
-          description: "Draft release notes.",
-          body: "Use the python script."
-        },
+        skill: testSkill(
+          "release-notes",
+          "Draft release notes.",
+          "Use the python script."
+        ),
         path: "scripts/format.py",
         input: { text: "hello" },
         source: `def run(input, ctx):
@@ -616,17 +653,17 @@ tool shout '{"text":"hello"}'`,
   });
 
   it("runs python skill files as CLI-style scripts", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "release-notes",
-          description: "Draft release notes.",
-          body: "Use the python script."
-        },
+        skill: testSkill(
+          "release-notes",
+          "Draft release notes.",
+          "Use the python script."
+        ),
         path: "scripts/format.py",
         input: { text: "hello" },
         source: `import json
@@ -655,17 +692,17 @@ print(template.replace("{{text}}", data["text"].upper()))`,
   });
 
   it("returns output files from python CLI-style scripts", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "python-writer",
-          description: "Write output files.",
-          body: "Use the python script."
-        },
+        skill: testSkill(
+          "python-writer",
+          "Write output files.",
+          "Use the python script."
+        ),
         path: "scripts/write.py",
         input: {},
         source: `import os
@@ -697,17 +734,17 @@ print("done")`
   });
 
   it("returns output files from python function-style scripts", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "python-writer",
-          description: "Write output files.",
-          body: "Use the python script."
-        },
+        skill: testSkill(
+          "python-writer",
+          "Write output files.",
+          "Use the python script."
+        ),
         path: "scripts/write.py",
         input: {},
         source: `def run(input, ctx):
@@ -728,17 +765,17 @@ print("done")`
   });
 
   it("rejects oversized python output artifacts", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "python-writer",
-          description: "Write output files.",
-          body: "Use the python script."
-        },
+        skill: testSkill(
+          "python-writer",
+          "Write output files.",
+          "Use the python script."
+        ),
         path: "scripts/write.py",
         input: {},
         source: `with open("/output/large.txt", "w") as handle:
@@ -748,7 +785,7 @@ print("done")`
   });
 
   it("runs python skill scripts with explicit tools", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER,
       tools: {
         shout: tool({
@@ -760,11 +797,11 @@ print("done")`
 
     await expect(
       runner.run({
-        skill: {
-          name: "release-notes",
-          description: "Draft release notes.",
-          body: "Use the python script."
-        },
+        skill: testSkill(
+          "release-notes",
+          "Draft release notes.",
+          "Use the python script."
+        ),
         path: "scripts/format.py",
         input: { text: "hello" },
         source: `async def run(input, ctx):
@@ -778,7 +815,7 @@ print("done")`
   });
 
   it("allows python skill scripts to call tools by dynamic name", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER,
       tools: {
         "format-title": tool({
@@ -790,11 +827,11 @@ print("done")`
 
     await expect(
       runner.run({
-        skill: {
-          name: "release-notes",
-          description: "Draft release notes.",
-          body: "Use the python script."
-        },
+        skill: testSkill(
+          "release-notes",
+          "Draft release notes.",
+          "Use the python script."
+        ),
         path: "scripts/format.py",
         input: { text: "hello" },
         source: `async def run(input, ctx):
@@ -807,7 +844,7 @@ print("done")`
   });
 
   it("allows python scripts to read from a provided workspace by default", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER,
       workspaceInstance: testWorkspace({
         "README.md": "hello from workspace"
@@ -816,11 +853,11 @@ print("done")`
 
     await expect(
       runner.run({
-        skill: {
-          name: "workspace-reader",
-          description: "Read workspace files.",
-          body: "Use python."
-        },
+        skill: testSkill(
+          "workspace-reader",
+          "Read workspace files.",
+          "Use python."
+        ),
         path: "scripts/read.py",
         input: {},
         source: `async def run(input, ctx):
@@ -831,18 +868,18 @@ print("done")`
 
   it("does not expose python workspace writes for read-only workspace access", async () => {
     const workspace = testWorkspace({});
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER,
       workspaceInstance: workspace
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "workspace-writer",
-          description: "Write workspace files.",
-          body: "Use python."
-        },
+        skill: testSkill(
+          "workspace-writer",
+          "Write workspace files.",
+          "Use python."
+        ),
         path: "scripts/write.py",
         input: {},
         source: `async def run(input, ctx):
@@ -851,21 +888,17 @@ print("done")`
       })
     ).rejects.toThrow("Workspace write access is not available");
 
-    await expect(workspace.readFile("generated.txt")).resolves.toBeNull();
+    await expect(workspace.readText("generated.txt")).resolves.toBeNull();
   });
 
   it("surfaces python script failures", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "broken",
-          description: "Broken skill.",
-          body: "Run broken script."
-        },
+        skill: testSkill("broken", "Broken skill.", "Run broken script."),
         path: "scripts/broken.py",
         input: {},
         source: `def run(input, ctx):
@@ -875,18 +908,14 @@ print("done")`
   });
 
   it("times out CPU-bound python CLI scripts", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER,
       timeout: 50
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "slow",
-          description: "Slow skill.",
-          body: "Run slow script."
-        },
+        skill: testSkill("slow", "Slow skill.", "Run slow script."),
         path: "scripts/slow.py",
         input: {},
         source: `while True:
@@ -896,7 +925,7 @@ print("done")`
   });
 
   it("allows bash scripts to read from a provided workspace by default", async () => {
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER,
       workspaceInstance: testWorkspace({
         "README.md": "hello from workspace"
@@ -905,11 +934,11 @@ print("done")`
 
     await expect(
       runner.run({
-        skill: {
-          name: "workspace-reader",
-          description: "Read workspace files.",
-          body: "Use bash."
-        },
+        skill: testSkill(
+          "workspace-reader",
+          "Read workspace files.",
+          "Use bash."
+        ),
         path: "scripts/read.sh",
         input: {},
         source: "workspace-read README.md"
@@ -923,18 +952,18 @@ print("done")`
 
   it("does not expose bash workspace writes for read-only workspace access", async () => {
     const workspace = testWorkspace({});
-    const runner = skills.runner({
+    const runner = createRunner({
       loader: env.LOADER,
       workspaceInstance: workspace
     });
 
     await expect(
       runner.run({
-        skill: {
-          name: "workspace-writer",
-          description: "Write workspace files.",
-          body: "Use bash."
-        },
+        skill: testSkill(
+          "workspace-writer",
+          "Write workspace files.",
+          "Use bash."
+        ),
         path: "scripts/write.sh",
         input: {},
         source: "echo nope | workspace-write generated.txt"
@@ -943,6 +972,6 @@ print("done")`
       exitCode: 127
     });
 
-    await expect(workspace.readFile("generated.txt")).resolves.toBeNull();
+    await expect(workspace.readText("generated.txt")).resolves.toBeNull();
   });
 });

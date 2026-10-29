@@ -20,6 +20,7 @@ import type {
 import {
   isDurableObjectCodeUpdateReset,
   isPlatformFailure,
+  resolveRetryConfig,
   tryN,
   validateRetryOptions
 } from "../retries";
@@ -143,17 +144,6 @@ type InsertResult<T> = {
   readonly created: boolean;
 };
 
-function resolveRetryConfig(
-  retry: RetryOptions | undefined,
-  defaults: Required<RetryOptions>
-): Required<RetryOptions> {
-  return {
-    maxAttempts: retry?.maxAttempts ?? defaults.maxAttempts,
-    baseDelayMs: retry?.baseDelayMs ?? defaults.baseDelayMs,
-    maxDelayMs: retry?.maxDelayMs ?? defaults.maxDelayMs
-  };
-}
-
 function isSchedulerJobPayload(value: unknown): value is SchedulerJobPayload {
   return (
     typeof value === "object" &&
@@ -170,8 +160,6 @@ function isSchedulerJobPayload(value: unknown): value is SchedulerJobPayload {
  * Lifecycle job queue; Lifecycle owns the physical alarm and the alarm
  * event loop, and Scheduler runs registered callbacks through Lifecycle's
  * host invocation boundary when its jobs come due.
- *
- * @experimental The API surface may change before stabilizing.
  */
 export class Scheduler<
   Handlers extends SchedulerHandlers = SchedulerCallbacks
@@ -736,7 +724,7 @@ export class Scheduler<
     callback: string,
     options?: ScheduleOptions
   ): void {
-    if (!this.lifecycle.starting()) return;
+    if (this.lifecycle.status() !== "starting") return;
     if (options?.idempotent !== undefined) return;
     if (typeof when === "string") return;
     if (this.#warnedStartupCallbacks.has(callback)) return;

@@ -462,6 +462,10 @@ export class Tasks<
           // over drive results), same as the local path below.
           return undefined;
         }
+        // `false` means the owner facet is gone: the route already cleaned
+        // up its prefix, so drop this mirrored wake instead of handing the
+        // queue an outcome it rejects.
+        if (winner.outcome === false) return undefined;
         return winner.outcome as LifecycleJobOutcome;
       } catch (error) {
         if (isPlatformFailure(error)) throw error;
@@ -1074,7 +1078,7 @@ export class Tasks<
 
     // Warm path: begin the first attempt immediately when the host is past
     // startup. The durable deadline above is authoritative either way.
-    if (startMode === "warm" && !this.lifecycle.starting()) {
+    if (startMode === "warm" && this.lifecycle.status() !== "starting") {
       void this.#executeRun(runId).catch(() => {});
     }
 

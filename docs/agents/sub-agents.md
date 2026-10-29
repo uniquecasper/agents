@@ -4,7 +4,7 @@ Dynamic agents are child Durable Objects **colocated under and supervised by** a
 
 Use dynamic agents for code whose **class or lifecycle the parent owns**: dynamically-loaded or AI-generated code that has no wrangler binding, per-run tool agents, sandboxed components that need isolated storage plus supervised abort/restart. That is what the runtime built facets for.
 
-Do **not** use dynamic agents to model an open-ended set of independent peers — many chats, documents, or sessions per user. Those want one top-level Durable Object each plus a per-user index; see [When to use dynamic agents](#when-to-use-dynamic-agents) and [`examples/next/chats`](https://github.com/cloudflare/agents/tree/main/examples/next/chats).
+Do **not** use dynamic agents to model an open-ended set of independent peers — many chats, documents, or sessions per user. Those want one top-level Durable Object each plus a per-user index; see [When to use dynamic agents](#when-to-use-dynamic-agents) and [`examples/next/routing`](https://github.com/cloudflare/agents/tree/main/examples/next/routing).
 
 If you want a parent chat agent to dispatch another chat-capable agent during a
 single turn and render that child's progress inline, use [Agent Tools](./agent-tools.md).
@@ -246,6 +246,15 @@ The hook receives the **original** request with its URL intact — including the
 
 WebSocket upgrade requests flow through this hook the same way as plain HTTP. If you return a mutated `Request`, keep the original `Upgrade: websocket` and `Sec-WebSocket-*` headers — cloning via `new Headers(req.headers)` and only adding or replacing entries is the safest recipe.
 
+When the hook returns a `Response` for a WebSocket upgrade, the framework accepts the socket and immediately closes it, because browsers hide the status of a failed handshake and reconnecting clients would retry it forever. The close code carries the status:
+
+| Returned status | Close code      | Client behavior                                                       |
+| --------------- | --------------- | --------------------------------------------------------------------- |
+| `4xx`           | `4000 + status` | Terminal: `useAgent` and `AgentClient` stop and set `connectionError` |
+| anything else   | `1011`          | Retried with backoff                                                  |
+
+The close reason is `Sub-agent connection rejected (<status>)`, so a `404` arrives as code `4404`. At the first `/sub/` hop, a returned `Response` that already carries a `webSocket` is passed through unchanged; deeper hops always close with the mapped code.
+
 ### `this.parentPath` and `this.selfPath`
 
 Root-first ancestor chains. `parentPath` covers strict ancestors; `selfPath` includes the current agent.
@@ -471,13 +480,13 @@ await user.recordChatActivity(chatId, { title, lastMessage, seq });
 
 `RoutedAgents` packages the hub side of this pattern: a durable ID-to-Agent catalog plus request and WebSocket forwarding under one route segment. See [Routing to independent Agents](./routing.md#routing-to-independent-agents).
 
-Each chat gets its own alarms, placement, and storage budget; deletion is one `chats.delete(id)` call; and "search across all my chats" reads only the index. The example treats that index as a best-effort derived projection: a failed push leaves it stale until the next message, and a push for a deleted chat is refused. See [`examples/next/chats`](https://github.com/cloudflare/agents/tree/main/examples/next/chats) for the pattern built on `RoutedAgents`, with tests. Idempotency and repair belong to the production design in [`design/rfc-user-chat-durable-objects.md`](https://github.com/cloudflare/agents/blob/main/design/rfc-user-chat-durable-objects.md).
+Each chat gets its own alarms, placement, and storage budget; deletion is one `chats.delete(id)` call; and "search across all my chats" reads only the index. The example treats that index as a best-effort derived projection: a failed push leaves it stale until the next message, and a push for a deleted chat is refused. See [`examples/next/routing`](https://github.com/cloudflare/agents/tree/main/examples/next/routing) for the pattern built on `RoutedAgents`, with tests. Idempotency and repair belong to the production design in [`design/rfc-user-chat-durable-objects.md`](https://github.com/cloudflare/agents/blob/main/design/rfc-user-chat-durable-objects.md).
 
 ## Examples
 
 - [`examples/next/dynamic-agents`](https://github.com/cloudflare/agents/tree/main/examples/next/dynamic-agents) — the headline use case: a supervisor stores user-submitted Durable Object code, loads it via Worker Loader, and runs it as facets with isolated storage, supervised abort, and code upgrades over stable state.
 - [`examples/agents-as-tools`](https://github.com/cloudflare/agents/tree/main/examples/agents-as-tools) — per-run child agents as tools with inline streaming.
-- [`examples/multi-ai-chat`](https://github.com/cloudflare/agents/tree/main/examples/multi-ai-chat) — a multi-session chat app built on facet children under one `Inbox`. It works and demonstrates the routing surface, but for many long-lived chats per user prefer the top-level-DO-per-chat pattern in [`examples/next/chats`](https://github.com/cloudflare/agents/tree/main/examples/next/chats) — see [When to use dynamic agents](#when-to-use-dynamic-agents).
+- [`examples/multi-ai-chat`](https://github.com/cloudflare/agents/tree/main/examples/multi-ai-chat) — a multi-session chat app built on facet children under one `Inbox`. It works and demonstrates the routing surface, but for many long-lived chats per user prefer the top-level-DO-per-chat pattern in [`examples/next/routing`](https://github.com/cloudflare/agents/tree/main/examples/next/routing) — see [When to use dynamic agents](#when-to-use-dynamic-agents).
 
 ## Related
 

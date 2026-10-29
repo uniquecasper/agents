@@ -119,11 +119,13 @@ type Promisify<T> = T extends Promise<unknown> ? T : Promise<T>;
  * are excluded — only user-defined methods on the subclass are exposed.
  */
 export type DynamicAgentStub<T extends Agent> = {
-  [K in keyof T as K extends keyof Agent
-    ? never
-    : T[K] extends (...args: never[]) => unknown
-      ? K
-      : never]: T[K] extends (...args: infer A) => infer R
+  [
+    K in keyof T as K extends keyof Agent
+      ? never
+      : T[K] extends (...args: never[]) => unknown
+        ? K
+        : never
+  ]: T[K] extends (...args: infer A) => infer R
     ? (...args: A) => Promisify<R>
     : never;
 };
@@ -184,4 +186,9 @@ export type RootFacetRpcSurface = {
     connectionId: string,
     state: unknown
   ): Promise<unknown>;
+  _cf_closeSubAgentConnectionsForPrefix(
+    prefix: ReadonlyArray<AgentPathStep>,
+    code: number,
+    reason: string
+  ): Promise<void>;
 };

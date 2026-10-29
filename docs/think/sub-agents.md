@@ -27,15 +27,19 @@ interface StreamCallback {
   onEvent(json: string): void | Promise<void>;
   onDone(): void | Promise<void>;
   onError(error: string): void | Promise<void>;
+  onInterrupted?(): void | Promise<void>;
 }
 ```
 
-| Method           | When it fires                                                   |
-| ---------------- | --------------------------------------------------------------- |
-| `onStart(event)` | Before work starts; exposes the request id for cancellation     |
-| `onEvent(json)`  | For each streaming chunk (JSON-serialized UIMessageChunk)       |
-| `onDone()`       | After the turn completes and the assistant message is persisted |
-| `onError(error)` | On error during the turn                                        |
+| Method            | When it fires                                                                        |
+| ----------------- | ------------------------------------------------------------------------------------ |
+| `onStart(event)`  | Before work starts; exposes the request id for cancellation                          |
+| `onEvent(json)`   | For each streaming chunk (JSON-serialized UIMessageChunk)                            |
+| `onDone()`        | After the turn completes and the assistant message is persisted                      |
+| `onError(error)`  | On error during the turn                                                             |
+| `onInterrupted()` | The stream stalled and recovery took over, so neither `onDone` nor `onError` follows |
+
+Each call ends with exactly one of `onDone`, `onError`, or `onInterrupted`. If you bridge `chat()` to an HTTP response (for example, a server-sent events stream), close the response in `onInterrupted` as well. Otherwise a stalled turn leaves the response open. The recovered answer is persisted and broadcast to WebSocket clients, not sent to this callback.
 
 ### ChatOptions
 
@@ -211,7 +215,11 @@ await this.saveMessages((current) => [
 
 ### Scheduled responses
 
-Trigger a recurring prompt turn with `getScheduledTasks()`:
+Declared scheduled tasks are armed on the **root agent only**.
+`getScheduledTasks()` is usually a static declaration, so it returns the same
+tasks on every instance of the class — arming it on sub-agents too would fire
+each occurrence once per live sub-agent on top of the root. Declare the task on
+the root and let it fan out to sub-agents itself:
 
 ```typescript
 export class MyAgent extends Think<Env> {
@@ -224,12 +232,43 @@ export class MyAgent extends Think<Env> {
       dailyReport: {
         schedule: "every day at 09:00",
         timezone: "UTC",
-        prompt: "Generate the daily report."
+        handler: async () => {
+          for (const { name } of this.listSubAgents(ChildAgent)) {
+            const chat = await this.subAgent(ChildAgent, name);
+            await chat.submitMessages([
+              {
+                id: crypto.randomUUID(),
+                role: "user",
+                parts: [{ type: "text", text: "Generate the daily report." }]
+              }
+            ]);
+          }
+        }
       }
     };
   }
 }
 ```
+
+If a class genuinely declares _different_ tasks per sub-agent — for example when
+`getScheduledTasks()` reads per-sub-agent state — opt in with
+`getScheduledTasksScope()` and each sub-agent owns an independent schedule:
+
+```typescript
+export class PerUserAgent extends Think<Env> {
+  getScheduledTasksScope() {
+    return "all" as const;
+  }
+
+  async getScheduledTasks() {
+    const reminder = await this.getReminderForThisUser();
+    return reminder ? { reminder } : {};
+  }
+}
+```
+
+A sub-agent that declares tasks without opting in logs a warning naming this
+hook, so an inert schedule is never silent.
 
 ### Chaining from onChatResponse
 
@@ -326,6 +365,8 @@ protected async continueLastTurn(
 
 Returns `{ requestId, status: "skipped" }` if the last message is not an assistant message.
 
+A direct call persists the new response as a separate assistant message after the last one, which suits "generate more" or self-correction flows. Recovery continuations (after an eviction, deploy, or stream stall) are different: they stream into the interrupted assistant message, keeping its id and parts, so a recovered answer stays a single message.
+
 Most applications do not call this directly. Treat `continueLastTurn()` as an
 advanced subclass and recovery primitive; user-facing, server-triggered turns
 usually use `saveMessages()` or `submitMessages()` instead.
@@ -358,7 +399,7 @@ Every turn entry path is wrapped in `runFiber`: WebSocket chat, sub-agent `chat(
 
 ### onChatRecovery
 
-When an interrupted chat fiber is detected after DO restart, Think calls the `onChatRecovery` hook:
+When an interrupted chat fiber is detected after DO restart, or when the stream-stall watchdog (`chatStreamStallTimeoutMs`) aborts a live turn, Think calls the `onChatRecovery` hook:
 
 ```typescript
 onChatRecovery(ctx: ChatRecoveryContext): ChatRecoveryOptions | void
@@ -444,8 +485,8 @@ export class MyAgent extends Think<Env> {
   chatRecovery = {
     maxAttempts: 10,
     noProgressTimeoutMs: 5 * 60 * 1000,
-    maxRecoveryWork: 1000,
-    maxOomRetries: 3,
+    maxRecoveryWork: 10_000,
+    maxInterruptedAttempts: 5,
     terminalMessage: "The assistant was interrupted and could not recover.",
     // Consulted from the second recovery attempt onward. Return false to stop.
     // Called as `config.shouldKeepRecovering(ctx)`, so it is NOT bound to the
@@ -461,20 +502,20 @@ export class MyAgent extends Think<Env> {
 }
 ```
 
-| Field                  | Default           | Description                                                                                                                                                                                                                                                                                                                                                                                          |
-| ---------------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `maxAttempts`          | `10`              | Attempt cap. Resets on forward progress, so it catches a tight no-progress alarm loop, not a healthy long turn.                                                                                                                                                                                                                                                                                      |
-| `stableTimeoutMs`      | `10_000`          | How long an attempt waits for the isolate to reach stable state before rescheduling.                                                                                                                                                                                                                                                                                                                 |
-| `noProgressTimeoutMs`  | `300_000` (5 min) | Primary stuck-turn bound: max time without forward progress before sealing. **Resets on every progress-bearing attempt.**                                                                                                                                                                                                                                                                            |
-| `maxRecoveryWork`      | `1000`            | Runaway-loop guard: max produced content/tool units since the incident opened before a still-progressing turn is sealed (`work_budget_exceeded`). A generous finite backstop so a turn that keeps emitting content but never converges (for example an isolate that runs out of memory mid-stream on every recovery) cannot loop forever. Raise it, or set `Infinity`, for a very long agentic turn. |
-| `maxOomRetries`        | `3`               | Tight retry budget for a Durable Object memory-limit reset (the isolate exceeded its 128 MB limit). An OOM usually re-OOMs on re-run, but can be a transient spike, so recovery retries a few times then seals with `out_of_memory`. Counts only attempts that ended in an OOM. Set `0` to seal on the first OOM.                                                                                    |
-| `shouldKeepRecovering` | —                 | Caller policy consulted from the second attempt onward. Return `false` to stop recovery. The hook point for a token/cost budget (`ctx.work` is a coarse segment count, not tokens).                                                                                                                                                                                                                  |
-| `terminalMessage`      | generic message   | Message shown to the user when recovery is given up on.                                                                                                                                                                                                                                                                                                                                              |
-| `onExhausted`          | —                 | Called once when recovery is given up on. Inspect `ctx.reason`.                                                                                                                                                                                                                                                                                                                                      |
+| Field                    | Default           | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ------------------------ | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `maxAttempts`            | `10`              | Attempt cap. Resets on forward progress, so it catches a tight no-progress alarm loop, not a healthy long turn.                                                                                                                                                                                                                                                                                                                                                         |
+| `stableTimeoutMs`        | `10_000`          | How long an attempt waits for the isolate to reach stable state before rescheduling.                                                                                                                                                                                                                                                                                                                                                                                    |
+| `noProgressTimeoutMs`    | `300_000` (5 min) | Primary stuck-turn bound: max time without forward progress before sealing. **Resets on every progress-bearing attempt.**                                                                                                                                                                                                                                                                                                                                               |
+| `maxRecoveryWork`        | `10000`           | Runaway-loop guard: max recovery work since the incident opened before a still-progressing turn is sealed (`work_budget_exceeded`), counted in durable stream segments (see [Recovery work units](https://github.com/cloudflare/agents/blob/main/docs/agents/chat-agents.md#recovery-work-units)). A generous finite backstop so a turn that keeps emitting content but never converges cannot loop forever. Raise it, or set `Infinity`, for a very long agentic turn. |
+| `maxInterruptedAttempts` | `5`               | How many of one turn's attempts may be interrupted (their isolate died before they finished, for example a memory-limit reset or a deploy) before recovery seals with `interrupted_attempts_exceeded`. The original turn counts. Progress never resets it. Replaces `maxOomRetries`, which is still read as `maxOomRetries + 1`.                                                                                                                                        |
+| `shouldKeepRecovering`   | —                 | Caller policy consulted from the second attempt onward. Return `false` to stop recovery. The hook point for a token/cost budget (`ctx.work` is a durable segment count, not tokens).                                                                                                                                                                                                                                                                                    |
+| `terminalMessage`        | generic message   | Message shown to the user when recovery is given up on.                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `onExhausted`            | —                 | Called once when recovery is given up on. Inspect `ctx.reason`.                                                                                                                                                                                                                                                                                                                                                                                                         |
 
-`ctx.reason` on the exhausted hook is one of: `no_progress_timeout` (stuck), `max_attempts_exceeded` (no-progress alarm loop), `work_budget_exceeded` (runaway), `out_of_memory` (repeated memory-limit resets), `recovery_aborted` (your `shouldKeepRecovering` returned `false`), or `stable_timeout` (extreme churn). See [`chat-agents.md`](https://github.com/cloudflare/agents/blob/main/docs/agents/chat-agents.md#stream-recovery) for the full shared reference — Think and `@cloudflare/ai-chat` use the same recovery configuration.
+`ctx.reason` on the exhausted hook is one of: `no_progress_timeout` (stuck), `max_attempts_exceeded` (no-progress alarm loop), `work_budget_exceeded` (runaway), `interrupted_attempts_exceeded` (the turn's attempts kept dying, for example to memory-limit resets), `out_of_memory` (sealed by the alarm memory-limit breaker), `recovery_aborted` (your `shouldKeepRecovering` returned `false`), or `stable_timeout` (extreme churn). See [`chat-agents.md`](https://github.com/cloudflare/agents/blob/main/docs/agents/chat-agents.md#stream-recovery) for the full shared reference — Think and `@cloudflare/ai-chat` use the same recovery configuration.
 
-> **Last-resort OOM backstop.** A memory-limit reset severe enough to bypass the budgets above (for example the Durable Object out-of-memories while loading state on wake, before recovery runs) is caught at the alarm boundary: after `maxAlarmMemoryLimitStrikes` (a base `Agent` static option, default `3`) consecutive alarms end in a memory-limit reset, the interrupted turn is sealed with `out_of_memory` and the platform's alarm-retry loop is stopped (emitting an `alarm:memory_limit_reset` event). This bounds the loop and the bill but does not shrink the working set — a turn that genuinely no longer fits in 128 MB needs a smaller context.
+> **Out-of-memory crash loops.** A turn that exceeds the 128 MB limit on every run is sealed by `maxInterruptedAttempts`: the next isolate counts each run that died before re-running it, because the isolate that hit the limit cannot write anything. The alarm boundary also stops the platform from retrying the alarm in a tight loop and emits an `alarm:memory_limit_reset` event; its `maxAlarmMemoryLimitStrikes` counter (a base `Agent` static option, default `3`) only advances while storage still accepts writes. None of this shrinks the working set: a turn that no longer fits in 128 MB needs a smaller context.
 
 ---
 

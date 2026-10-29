@@ -192,6 +192,23 @@ type StoredSessions = Record<
   { sessionId: string; createdAt: number; updatedAt: number }
 >;
 
+interface NamedRunOutput {
+  status: "completed" | "error";
+  result?: unknown;
+  error?: string;
+  report: {
+    restarted: boolean;
+    newTabs: Array<{ targetId: string; url?: string }>;
+    tabClosed: boolean;
+    tabShared: boolean;
+  } | null;
+}
+
+/** Run code against the persistent named browser, in a scope. */
+async function runNamed(code: string, scope?: string): Promise<NamedRunOutput> {
+  return (await callAgent("runNamed", [code, scope])) as NamedRunOutput;
+}
+
 async function run(
   code: string,
   mode: "one-shot" | "reuse" | "dynamic" = "one-shot"
@@ -587,6 +604,218 @@ describe("browser connector e2e", () => {
       expect(typeof probe.concurrent).toBe("boolean");
 
       await callAgent("closeSession", ["reuse"]);
+    });
+  });
+  // The persistent named browser, driven through a BrowserSession and
+  // runBrowserCode as browserTool does. These run
+  // against real Chrome, so they also check what the unit-test fake assumes.
+  describe("persistent named browser", () => {
+    afterAll(async () => {
+      await callAgent("closeNamed");
+    });
+
+    const setTitle = (title: string) => `async () => {
+      await browser.cdp({
+        method: "Runtime.evaluate",
+        params: { expression: "document.title = '${title}'" },
+        sessionId: "active"
+      });
+    }`;
+    const readTitle = `async () => {
+      const { result } = await browser.cdp({
+        method: "Runtime.evaluate",
+        params: { expression: "document.title", returnByValue: true },
+        sessionId: "active"
+      });
+      return result.value;
+    }`;
+
+    it("keeps the active tab's page between executions", async () => {
+      const first = await runNamed(setTitle("kept"));
+      expect(first.status).toBe("completed");
+
+      const second = await runNamed(readTitle);
+      expect(second.status).toBe("completed");
+      expect(second.result).toBe("kept");
+      expect(second.report?.restarted).toBe(false);
+    });
+
+    it("keeps a separate tab per scope", async () => {
+      await runNamed(setTitle("scope-a"), "a");
+      await runNamed(setTitle("scope-b"), "b");
+
+      expect((await runNamed(readTitle, "a")).result).toBe("scope-a");
+      expect((await runNamed(readTitle, "b")).result).toBe("scope-b");
+    });
+
+    it("says when another scope closed this scope's tab", async () => {
+      await runNamed(setTitle("doomed"), "closed");
+      const closed = await runNamed(
+        `async () => {
+        const { targetInfos } = await browser.cdp({ method: "Target.getTargets" });
+        for (const tab of targetInfos) {
+          if (tab.type === "page" && tab.title === "doomed") {
+            await browser.cdp({ method: "Target.closeTarget", params: { targetId: tab.targetId } });
+          }
+        }
+      }`,
+        "closer"
+      );
+      expect(closed.status).toBe("completed");
+
+      const after = await runNamed(readTitle, "closed");
+      expect(after.report?.tabClosed).toBe(true);
+      expect(after.result).not.toBe("doomed");
+    });
+
+    it("reports a popup as a new tab without switching to it", async () => {
+      await runNamed(setTitle("opener"));
+      const output = await runNamed(`async () => {
+        await browser.cdp({
+          method: "Runtime.evaluate",
+          params: { expression: "void window.open('about:blank', '_blank')", userGesture: true },
+          sessionId: "active"
+        });
+      }`);
+      expect(output.status).toBe("completed");
+      expect(output.report?.newTabs).toHaveLength(1);
+
+      const title = await runNamed(readTitle);
+      expect(title.result).toBe("opener");
+    });
+
+    it("reports noopener popups as new tabs too", async () => {
+      await runNamed(setTitle("noopener-opener"));
+      // Chrome still sets openerId on these; only canAccessOpener is false.
+      const output = await runNamed(`async () => {
+        const open = (expression) => browser.cdp({
+          method: "Runtime.evaluate",
+          params: { expression, userGesture: true },
+          sessionId: "active"
+        });
+        await open("void window.open('about:blank#noopener', '_blank', 'noopener')");
+        await open("(() => { const a = document.createElement('a'); a.href = 'about:blank#rel-noopener'; a.target = '_blank'; a.rel = 'noopener noreferrer'; document.body.appendChild(a); a.click(); })()");
+      }`);
+      expect(output.status).toBe("completed");
+      const urls = (output.report?.newTabs ?? []).map((tab) => tab.url);
+      expect(urls).toEqual(
+        expect.arrayContaining([
+          "about:blank#noopener",
+          "about:blank#rel-noopener"
+        ])
+      );
+    });
+
+    it("passes a raw Target.attachToTarget through to Chrome", async () => {
+      await runNamed(setTitle("raw-attach"));
+      const output = await runNamed(`async () => {
+        const { targetInfos } = await browser.cdp({ method: "Target.getTargets" });
+        const page = targetInfos.find((t) => t.type === "page" && t.title === "raw-attach");
+        const { sessionId } = await browser.cdp({
+          method: "Target.attachToTarget",
+          params: { targetId: page.targetId, flatten: true }
+        });
+        const { result } = await browser.cdp({
+          method: "Runtime.evaluate",
+          params: { expression: "document.title", returnByValue: true },
+          sessionId
+        });
+        return { sessionId, title: result.value };
+      }`);
+      expect(output.status).toBe("completed");
+      const { sessionId, title } = output.result as {
+        sessionId: string;
+        title: string;
+      };
+      expect(sessionId).not.toMatch(/^target:/);
+      expect(title).toBe("raw-attach");
+
+      const later = await runNamed(`async () => {
+        await browser.cdp({
+          method: "Runtime.evaluate",
+          params: { expression: "1" },
+          sessionId: "${sessionId}"
+        });
+      }`);
+      expect(later.status).toBe("error");
+      expect(later.error).toContain("don't carry over between runs");
+    });
+
+    it("doesn't report a tab opened with Target.createTarget as a popup", async () => {
+      const output = await runNamed(`async () => {
+        const { targetId } = await browser.cdp({
+          method: "Target.createTarget",
+          params: { url: "about:blank" }
+        });
+        return targetId;
+      }`);
+      expect(output.status).toBe("completed");
+      expect(output.report?.newTabs).toEqual([]);
+    });
+
+    it('teaches sessionId: "active" for a page command sent without one', async () => {
+      const output = await runNamed(`async () => {
+        await browser.cdp({ method: "Runtime.evaluate", params: { expression: "1" } });
+      }`);
+      expect(output.status).toBe("error");
+      expect(output.error).toContain('sessionId: "active"');
+    });
+
+    it("explains that a CDP event cannot be sent, using the live spec", async () => {
+      const output = await runNamed(`async () => {
+        await browser.cdp({ method: "Page.loadEventFired" });
+      }`);
+      expect(output.status).toBe("error");
+      expect(output.error).toContain("CDP *event*");
+    });
+
+    it("reattaches after the model detaches from the active tab", async () => {
+      await runNamed(setTitle("detached"));
+      const output = await runNamed(`async () => {
+        const { targetInfos } = await browser.cdp({ method: "Target.getTargets" });
+        await browser.cdp({
+          method: "Runtime.evaluate",
+          params: { expression: "1" },
+          sessionId: "active"
+        });
+        const page = targetInfos.find((t) => t.type === "page" && t.title === "detached");
+        await browser.cdp({
+          method: "Target.detachFromTarget",
+          params: { targetId: page.targetId }
+        });
+        const { result } = await browser.cdp({
+          method: "Runtime.evaluate",
+          params: { expression: "document.title", returnByValue: true },
+          sessionId: "active"
+        });
+        return result.value;
+      }`);
+      expect(output.status).toBe("completed");
+      expect(output.result).toBe("detached");
+    });
+
+    it("refuses to close the browser", async () => {
+      await runNamed(setTitle("survivor"));
+      const output = await runNamed(`async () => {
+        await browser.cdp({ method: "Browser.close" });
+      }`);
+      expect(output.status).toBe("error");
+      expect(output.error).toContain("managed for you");
+
+      const after = await runNamed(readTitle);
+      expect(after.result).toBe("survivor");
+      expect(after.report?.restarted).toBe(false);
+    });
+
+    it("reports restarted when the browser was replaced", async () => {
+      await runNamed(setTitle("lost"));
+      const key = (await callAgent("namedSessionKey")) as string;
+      await callAgent("corruptStoredSession", [key]);
+
+      const output = await runNamed(readTitle);
+      expect(output.status).toBe("completed");
+      expect(output.report?.restarted).toBe(true);
+      expect(output.result).not.toBe("lost");
     });
   });
 });

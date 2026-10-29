@@ -1,7 +1,5 @@
 /**
  * Durable Object lifecycle composition.
- *
- * @experimental Every export here may change before stabilizing.
  */
 export {
   LifecycleCapability,
@@ -11,6 +9,7 @@ export {
   type LifecycleHostContextScope,
   type LifecycleRoutes,
   type LifecycleServices,
+  type LifecycleStatus,
   type LifecycleSockets
 } from "./capability";
 export {
@@ -21,7 +20,6 @@ export {
 export {
   Lifecycle,
   type LifecycleOptions,
-  type LifecycleUseOptions,
   type MemoryLimitContext,
   type LifecycleJobContext,
   type LifecycleJobs,

@@ -12,8 +12,9 @@ Focused protocol examples can be server-only when a frontend would obscure the c
 
 Early-access examples for a coordinated PR stack live under `examples/next/`.
 Each runnable child is an independent workspace package matched by
-`examples/next/*`; `examples/next/README.md` records the stack order. Move an
-example into the main catalog only after its public API stabilizes.
+`examples/next/*`. Harness examples are grouped under
+`examples/next/harnesses/*`; `examples/next/README.md` records the stack order.
+Move an example into the main catalog only after its public API stabilizes.
 
 Full-stack examples use the [Cloudflare Vite plugin](https://developers.cloudflare.com/workers/vite-plugin/) for development and builds. Server-only examples use Wrangler directly.
 
@@ -224,7 +225,7 @@ Every example should include an info card at the top of the page explaining what
 
 ### Chat message rendering
 
-Any example with a chat UI (`useAgentChat` from `@cloudflare/ai-chat/react` or `@cloudflare/think/react`, or `useChat`) must render the full shape of an assistant turn — not just text. Reference implementations: **`examples/ai-chat`** (streamdown + complete tool states) and **`examples/assistant`** (adds reasoning + approvals + branches).
+Any example with a chat UI (`useAgentChat` from `@cloudflare/ai-chat/react` or `@cloudflare/think/react`, or `useChat`) must render the full shape of an assistant turn — not just text. Reference implementations: **`examples/ai-chat`** (streamdown + complete tool states) and **`examples/computer-skills`** (adds reasoning parts).
 
 Rules:
 
@@ -262,7 +263,7 @@ import { code } from "@streamdown/code";
 </Streamdown>;
 ```
 
-Tailwind ignores `node_modules`, so `src/styles.css` needs `@source` lines plus the `.sd-theme` bridge that maps Streamdown's tokens to Kumo. Copy the `@source ".../streamdown/..."` / `@source ".../@streamdown/code/..."` lines and the `.sd-theme { ... }` block from `examples/assistant/src/styles.css` verbatim.
+Tailwind ignores `node_modules`, so `src/styles.css` needs `@source` lines plus the `.sd-theme` bridge that maps Streamdown's tokens to Kumo. Copy the `@source ".../streamdown/..."` / `@source ".../@streamdown/code/..."` lines and the `.sd-theme { ... }` block from `examples/ai-chat/src/styles.css` verbatim.
 
 ### Agent communication
 

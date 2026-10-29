@@ -9,10 +9,15 @@ import {
   type ProxyToolOutput
 } from "@cloudflare/codemode";
 import { BrowserConnector } from "../browser/connector";
+import { browserFunctions } from "../browser/browser-functions";
+import { runBrowserCode } from "../browser/sandbox";
+import type { BrowserSessionReport } from "../browser/session";
+import { Browser, namedBrowserSessionKey } from "../browser/browser";
+import { browserRun } from "../browser/providers/browser-run";
 import {
   DurableBrowserSessionStore,
   type StoredBrowserSession
-} from "../browser/session-manager";
+} from "../browser/session-store";
 import {
   listBrowserTargets,
   connectBrowserSession,
@@ -31,6 +36,9 @@ type Env = {
 };
 
 type SessionMode = "one-shot" | "reuse" | "dynamic";
+
+/** The named session the persistent-browser tests drive. */
+const NAMED_SESSION = "e2e";
 
 /** Approval-gated connector used to pause executions mid-run in tests. */
 class GateConnector extends CodemodeConnector<Env> {
@@ -88,6 +96,61 @@ export class BrowserTestAgent extends Agent<Env> {
       { code },
       { toolCallId: crypto.randomUUID(), messages: [] }
     )) as ProxyToolOutput;
+  }
+
+  // ── Persistent named browser (BrowserSession + runBrowserCode) ──
+
+  #namedBrowser(): Browser {
+    return new Browser({
+      provider: browserRun(this.env.BROWSER),
+      name: NAMED_SESSION,
+      store: this.#store()
+    });
+  }
+
+  /**
+   * Run code against the persistent browser the way `browserTool`
+   * does: one session per run, the code in a Dynamic Worker. Includes the
+   * session's report.
+   */
+  @callable()
+  async runNamed(
+    code: string,
+    scope?: string
+  ): Promise<
+    (
+      | { status: "completed"; result: unknown }
+      | { status: "error"; error: string }
+    ) & { logs: string[]; report: BrowserSessionReport | null }
+  > {
+    const session = this.#namedBrowser().session({ scope });
+    try {
+      const ran = await runBrowserCode({
+        loader: this.env.LOADER,
+        code,
+        functions: browserFunctions(session),
+        timeoutMs: 60_000
+      });
+      const report = (await session.close()) ?? null;
+      return "error" in ran
+        ? { status: "error", error: ran.error, logs: ran.logs, report }
+        : { status: "completed", result: ran.result, logs: ran.logs, report };
+    } finally {
+      // Already closed unless the run threw; a second close does nothing.
+      await session.close();
+    }
+  }
+
+  /** Close the persistent browser so it doesn't outlive the suite. */
+  @callable()
+  async closeNamed(): Promise<void> {
+    await this.#namedBrowser().close();
+  }
+
+  /** Storage key of the named session, for corruptStoredSession. */
+  @callable()
+  async namedSessionKey(): Promise<string> {
+    return namedBrowserSessionKey(NAMED_SESSION);
   }
 
   @callable()

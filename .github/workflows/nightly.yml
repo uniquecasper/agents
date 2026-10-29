@@ -37,7 +37,7 @@ jobs:
 
       - name: Get Playwright version
         id: playwright-version
-        run: echo "version=$(node -p 'require(\"playwright/package.json\").version')" >> $GITHUB_OUTPUT
+        run: echo "version=$(node -p "require('playwright/package.json').version")" >> $GITHUB_OUTPUT
 
       - name: Cache Playwright browsers
         uses: actions/cache@v5
@@ -72,7 +72,7 @@ jobs:
 
       - name: Get Playwright version
         id: playwright-version
-        run: echo "version=$(node -p 'require(\"playwright/package.json\").version')" >> $GITHUB_OUTPUT
+        run: echo "version=$(node -p "require('playwright/package.json').version")" >> $GITHUB_OUTPUT
 
       - name: Cache Playwright browsers
         uses: actions/cache@v5
@@ -214,7 +214,7 @@ jobs:
 
       - name: Get Playwright version
         id: playwright-version
-        run: echo "version=$(node -p 'require(\"playwright/package.json\").version')" >> $GITHUB_OUTPUT
+        run: echo "version=$(node -p "require('playwright/package.json').version")" >> $GITHUB_OUTPUT
 
       - name: Cache Playwright browsers
         uses: actions/cache@v5
@@ -249,7 +249,7 @@ jobs:
 
       - name: Get Playwright version
         id: playwright-version
-        run: echo "version=$(node -p 'require(\"playwright/package.json\").version')" >> $GITHUB_OUTPUT
+        run: echo "version=$(node -p "require('playwright/package.json').version")" >> $GITHUB_OUTPUT
 
       - name: Cache Playwright browsers
         uses: actions/cache@v5
@@ -281,21 +281,13 @@ jobs:
         with:
           fetch-depth: 1
 
-      # Pin an exact pre-bug Node patch. Wrangler's local Browser Rendering
-      # simulator downloads its own Chrome via @puppeteer/browsers, whose
-      # extract-zip dep silently aborts mid-extraction on Node 24.16+
-      # (puppeteer/puppeteer#14957). That leaves a partial Chrome cache, which
-      # Wrangler then "clears and retries" on every test — a re-corrupting loop
-      # that, with retry:3 + a 120s test timeout, ran this job to the 30m cancel.
       - uses: ./.github/actions/install
-        with:
-          node-version: 24.15.0
 
       - run: pnpm run build
 
       - name: Get Playwright version
         id: playwright-version
-        run: echo "version=$(node -p 'require(\"playwright/package.json\").version')" >> $GITHUB_OUTPUT
+        run: echo "version=$(node -p "require('playwright/package.json').version")" >> $GITHUB_OUTPUT
 
       - name: Cache Playwright browsers
         uses: actions/cache@v5

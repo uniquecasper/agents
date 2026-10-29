@@ -145,7 +145,7 @@ the container's coding filesystem.
   alive). Without it the Docker build's HTTPS fetches fail with certificate
   errors. Hosts without WARP need nothing.
 - **Editing `skills/**` does nothing until you reseed R2**
-(`npm run seed:r2`, or `-- --local` for local dev). The deployed worker
+  (`npm run seed:r2`, or `-- --local` for local dev). The deployed worker
   reads skills from the bucket, not from the repo.
 - **Deploy order matters**: agent-think first (creates the `AgentThink`
   entrypoint), then gh-app (whose service binding points at it).
@@ -191,7 +191,7 @@ npm run seed:r2  # push skills/** to the R2 bucket (add -- --local for dev)
   (`CLOUDFLARE_ACCOUNT_ID=b8afc92c7a87f699592038b756153d22`).
 - Model: `gpt-5.6-sol` with max reasoning through the OpenAI Responses API
   and team AI Gateway token, with a client-side fallback to
-  `claude-opus-4-8` when the primary dispatch fails. Responses use
+  `claude-opus-5-5` when the primary dispatch fails. Responses use
   `store: false`, so agent-think does not persist provider reasoning state.
 - Agent-think uses the monorepo's Agents, AI Chat, and Think workspace
   packages and opts into full message/tool payload spans. The turn safety cap
